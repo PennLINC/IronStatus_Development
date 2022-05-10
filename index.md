@@ -1,0 +1,1493 @@
+---
+title: "Development of iron status during youth"
+author: "Bart Larsen"
+date: "5/09/2022"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(mgcv)
+library(factoextra)
+library(emmeans)
+library(kableExtra)
+library(gratia)
+library(broom)
+library(cowplot)
+library(patchwork)
+library(viridis)
+theme_set(theme_classic(base_size = 20))
+knitr::knit_hooks$set(inline = function(x) {
+  if(!is.numeric(x)){
+    x
+    }else{
+      prettyNum(round(x,2), big.mark=",")
+      } 
+  })
+options(scipen=8)
+source('~/Box Sync/Work/BBL/Code/Tools/GAMM_plotting.R')
+source('~/Box Sync/Work/BBL/Code/Tools/GAM_Effects.R')
+knitr::opts_chunk$set(fig.height = 6,fig.width = 6,warning = FALSE,fig.path="figures/",fig.retina = 1,dpi=300)
+```
+
+```{r functions,include=FALSE}
+#this function matches each cognitive visit to its closest blood measurement.
+# blood_measure: the name of the blood measurement to match. This must match its `COMPONENT_NAME`
+# time_diff: amount of time in years the blood measurement can maximally differ from the time of the cognitive measurement to be included (e.g. .5 means the blood measure must be within 6 months prior to the cog measurement to be included)
+# abs_diff: If true, we include blood measurements that are +/- the "time_diff" from the cognitive measurement (absolute value). 
+# use_refs: This is optional and allows for you to exclude blood measurements that fall outside of the lab specific normal range.
+match_cognition_and_blood <- function(df,blood_measure,time_diff,abs_diff=FALSE,use_refs=FALSE,filter_CRP=FALSE){
+  df<-df %>%rename(blood_val := blood_measure)
+  blood_df <- df %>%
+    # filter(COMPONENT_NAME == blood_measure)%>%
+    mutate(oSex = ordered(sex,levels = c(1,2), labels = c("male","female")))%>% #making this an ordered factor for convenience
+    mutate(blood_cog_diff1 = COG_AGE_timepoint1-Age)%>% #Calculating the difference between the each blood measure and each cognitive timepoint.
+    mutate(blood_cog_diff2 = COG_AGE_timepoint2-Age)%>%
+    mutate(blood_cog_diff3 = COG_AGE_timepoint3-Age)
+  if (filter_CRP == TRUE){
+    blood_df <- blood_df %>%
+      filter(CRP <=4|is.na(CRP))
+  }
+  if (use_refs == TRUE){
+    switch (blood_measure,
+      "Ferritin" = {blood_df <- blood_df %>%
+      filter(blood_val<REFERENCE_HIGH)},
+      "Transferrin" = {blood_df <- blood_df %>%
+      filter(blood_val<REFERENCE_LOW)},
+      "CALCULATED TIBC" = {blood_df <- blood_df %>%
+      filter(blood_val<REFERENCE_LOW)}
+    )
+  }
+
+  if (abs_diff==TRUE) {
+     blood_summary<- blood_df %>%
+      group_by(bblid)%>%
+      summarize(blood_mean1 = mean(blood_val[abs(blood_cog_diff1)<=time_diff],na.rm = T),#getting the mean of the blood test values for all visits within the absolute value of the range specified.
+                blood_mean2 = mean(blood_val[abs(blood_cog_diff2)<=time_diff],na.rm = T),
+                blood_mean3 = mean(blood_val[abs(blood_cog_diff3)<=time_diff],na.rm = T))
+  } else {
+     blood_summary<- blood_df %>% #not using absolute value.
+      group_by(bblid)%>%
+      summarize(blood_mean1 = mean(blood_val[blood_cog_diff1<=time_diff & blood_cog_diff1>-.05],na.rm = T), #using a small fudge factor to allow blood measurements that came within ~2 weeks of the cog test because iron status will be fairly stable over that time frame.
+                blood_mean2 = mean(blood_val[blood_cog_diff2<=time_diff & blood_cog_diff2>-.05],na.rm = T),
+                blood_mean3 = mean(blood_val[blood_cog_diff3<=time_diff & blood_cog_diff3>-.05],na.rm = T))
+  }
+   
+  # The rest of this just matches things up properly.
+    blood_summary_long <- blood_summary %>% #Pivoting the wide dataframe of blood metrics to a long dataframe
+      pivot_longer(cols = c(contains("blood_mean")),names_to = "timepoint",values_to = blood_measure,names_pattern = "blood_mean(.*)")
+    cog_long <- df %>% # select the cognitive and demographic columns and pivot to longformat.
+      select(contains("NAR")|contains("COG_AGE")|contains("bblid"),sex,oSex) %>%
+      pivot_longer(cols = c(contains("NAR")|contains("COG_AGE")),names_to = c(".value","timepoint"),names_pattern = "(.*)_timepoint(.*)")
+    blood_cog_df <- blood_summary_long %>% left_join(cog_long,by = c("bblid","timepoint"))%>% distinct() %>% na.omit() #join the blood dataframe and cognitive dataframes. Omit any na rows for convenience.
+    return(blood_cog_df)
+}
+
+
+#This is the same as the above but it matches the scan data to the blood measurements.
+match_scan_and_blood <- function(df,blood_measure,time_diff,abs_diff=FALSE){
+  df<-df %>%rename(blood_val := blood_measure)
+  blood_df <- df %>%
+    # filter(COMPONENT_NAME == blood_measure)%>%
+    mutate(blood_val = as.numeric(blood_val)) %>%
+    mutate(oSex = ordered(sex,levels = c(1,2), labels = c("male","female")))%>%
+    mutate(blood_scan_diff1 = age_timepoint1-Age)
+
+  if (abs_diff==TRUE) {
+    blood_summary<- blood_df %>%
+      group_by(bblid)%>%
+      summarize(blood_mean1 = mean(blood_val[abs(blood_scan_diff1)<=time_diff],na.rm = T))
+  } else {
+    blood_summary<- blood_df %>%
+      group_by(bblid)%>%
+      summarize(blood_mean1 = mean(blood_val[blood_scan_diff1<=time_diff  & blood_scan_diff1>-.05],na.rm = T))
+  }
+    
+    blood_summary_long <- blood_summary %>% 
+      pivot_longer(cols = c(contains("blood_mean")),names_to = "scan_timepoint",values_to = blood_measure,names_pattern = "blood_mean(.*)")%>%
+      na.omit()
+    scan_long <-  blood_df %>% 
+      select(
+        contains("age_timepoint",ignore.case = FALSE)|contains("bblid")|contains("BBL_ID")|
+          contains("dti")|
+          contains("comp")|
+          contains("Accumbens")|
+          contains("Putamen")|
+          contains("Caudate")|
+          contains("Pallidum"),
+        sex) %>% distinct()%>%
+      pivot_longer(cols = c(
+        contains("Accumbens")|
+          contains("Putamen")|
+          contains("Caudate")|
+          contains("Pallidum")|
+          contains("dti")|contains("comp")|
+          contains("age_timepoint",ignore.case = FALSE)),
+        names_to = c(".value","scan_timepoint"),
+        names_pattern = "(.*)_timepoint(.*)")%>%
+      mutate(SCAN_AGE = age)
+    blood_scan_df <- blood_summary_long %>% left_join(scan_long,by = c("bblid"="BBL_ID","scan_timepoint"))
+    return(blood_scan_df)
+}
+
+#This is similar to the above functions but it matches PC scores from the PCA to the cognitive tests.
+match_PCA_and_cog <- function(df,PC,time_diff,abs_diff = FALSE){
+  blood_df <- df %>%
+    rename(PC_score := !!PC) %>%
+    mutate(oSex = ordered(sex,levels = c(1,2), labels = c("male","female")))%>%
+    mutate(blood_cog_diff1 = COG_AGE_timepoint1-Age)%>%
+    mutate(blood_cog_diff2 = COG_AGE_timepoint2-Age)%>%
+    mutate(blood_cog_diff3 = COG_AGE_timepoint3-Age)
+
+  if (abs_diff == TRUE) {
+    blood_summary<- blood_df %>%
+      mutate_at(vars(BBL_ID),.funs = as.character)%>%
+      group_by(BBL_ID)%>%
+      summarize(PC_mean1 = mean(PC_score[abs(blood_cog_diff1)<=time_diff],na.rm = T),
+                PC_mean2 = mean(PC_score[abs(blood_cog_diff2)<=time_diff],na.rm = T),
+                PC_mean3 = mean(PC_score[abs(blood_cog_diff3)<=time_diff],na.rm = T),
+                clinical_range = any(clinical_range[abs(blood_cog_diff1)<=time_diff]==TRUE,na.rm = T))
+  }  else {
+    blood_summary<- blood_df %>%
+      mutate_at(vars(BBL_ID),.funs = as.character)%>%
+      group_by(BBL_ID)%>%
+      summarize(PC_mean1 = mean(PC_score[blood_cog_diff1<=time_diff & blood_cog_diff1>=-0.05],na.rm = T),
+                PC_mean2 = mean(PC_score[blood_cog_diff2<=time_diff & blood_cog_diff2>=-0.05],na.rm = T),
+                PC_mean3 = mean(PC_score[blood_cog_diff3<=time_diff & blood_cog_diff3>=-0.05],na.rm = T))
+                # clinical_range = any(clinical_range[abs(blood_cog_diff1)<=time_diff]==TRUE,na.rm = T))
+  }
+
+    blood_summary_long <- blood_summary %>% 
+      pivot_longer(cols = c(contains("PC_mean")),names_to = "timepoint",values_to = PC,names_pattern = "PC_mean(.*)")
+    cog_long <- df %>% 
+      mutate_at(vars(BBL_ID),.funs = as.character)%>%
+      select(contains("NAR")|contains("COG_AGE")|contains("BBL_ID"),sex) %>%
+      pivot_longer(cols = c(contains("NAR")|contains("COG_AGE")),names_to = c(".value","timepoint"),names_pattern = "(.*)_timepoint(.*)")
+
+    blood_cog_df <- blood_summary_long %>% left_join(cog_long,by = c("BBL_ID","timepoint"))%>% distinct() %>% na.omit()
+    return(blood_cog_df)
+}
+
+#This matches the PC scores and scan visits
+match_PCA_and_scan <- function(df,PC,time_diff){
+
+  blood_df <- df %>%
+    rename(PC_score := !!PC) %>%
+    mutate(oSex = ordered(sex,levels = c(1,2), labels = c("male","female")))%>%
+    mutate(blood_cog_diff1 = age_timepoint1-Age)%>%
+    mutate(blood_cog_diff2 = age_timepoint2-Age) #%>%
+    # mutate(blood_cog_diff3 = age_timepoint3-Age)%>%
+    # mutate(blood_cog_diff4 = age_timepoint4-Age)
+
+    blood_summary<- blood_df %>%
+      mutate_at(vars(BBL_ID),.funs = as.character)%>%
+      group_by(BBL_ID)%>%
+      summarize(PC_mean1 = mean(PC_score[abs(blood_cog_diff1)<=time_diff],na.rm = T),
+                PC_mean2 = mean(PC_score[abs(blood_cog_diff2)<=time_diff],na.rm = T))
+                # PC_mean3 = mean(PC_score[abs(blood_cog_diff3)<=time_diff],na.rm = T),
+                # PC_mean4 = mean(PC_score[abs(blood_cog_diff4)<=time_diff],na.rm = T))
+    blood_summary_long <- blood_summary %>% 
+      pivot_longer(cols = c(contains("PC_mean")),names_to = "scan_timepoint",values_to = PC,names_pattern = "PC_mean(.*)")%>%na.omit()
+    cog_long <- df %>% 
+      mutate_at(vars(BBL_ID),.funs = as.character)%>%
+      select(
+        contains("age_timepoint",ignore.case = FALSE)|contains("BBL_ID")|
+          contains("dti")|
+          contains("Accumbens")|
+          contains("Putamen")|
+          contains("Caudate")|
+          contains("Pallidum"),
+        sex) %>% distinct()%>%
+      pivot_longer(cols = c(contains("dti")|contains("Accumbens")|contains("Putamen")|contains("Caudate")|contains("Pallidum")|contains("age_timepoint",ignore.case = FALSE)),
+                   names_to = c(".value","scan_timepoint"),
+                   names_pattern = "(.*)_timepoint(.*)")%>%
+      mutate(SCAN_AGE = age)
+
+    blood_cog_df <- blood_summary_long %>% 
+      left_join(cog_long,by = c("BBL_ID","scan_timepoint"))%>% 
+      distinct() %>% 
+      na.omit()
+    return(blood_cog_df)
+}
+
+format_regression_table <- function(input_table,caption=NULL,filename=NULL){
+  result_table<-input_table %>%
+  mutate(fdr.p2 = case_when(fdr.p <.001 ~ "< .001",
+                            fdr.p>.001 ~ str_remove(as.character(round(fdr.p,digits = 3)),"0+")),
+         p2 = case_when(p.value <.001 ~ "< .001",
+                            p.value>.001 ~ str_remove(as.character(round(p.value,digits = 3)),"0+")))%>%
+    select(Metric,edf,statistic,partialr2,p2,fdr.p2)
+
+Formatted_table <- result_table %>%
+    kableExtra::kable(caption = paste("<b>",caption,"</b>"),
+                      col.names = c("Response var.","<i>edf</i>","<i>F</i>",
+                                    "<i>R</i><sup>2</sup><sub>partial</sub>",
+                                    "<i>P</i>",
+                                    "<i>P</i><sub><small>FDR</small></sub>"),
+                      align="lcccc",escape = F,
+                      digits = c(0,2,1,2,3,1))%>%
+  footnote(general = "<i>abbr</i>. <i>edf</i>: Effective degrees of freedom; FDR: False discovery rate.",escape = F)%>%
+  kableExtra::kable_classic(full_width=F,position="left",font_size=12,html_font="arial")
+return(Formatted_table)
+}
+
+```
+
+# Development of iron status in the PNC and associations with cognitive performance and white matter integrity.
+
+```{r load_data,include=FALSE,cache=FALSE}
+#### Loading the input dataframe ####
+df <- readRDS(file= "Files/input_dataframe.rds")
+
+#### Loading SES ####
+ses <- fread('Files/n9498_go1_environment_factor_scores_tymoore_20150909.csv')%>%
+  mutate(bblid=as.character(bblid))
+
+df <- df %>%
+  rename(Transferrin:=TRANSFERRIN, Ferritin := FERRITIN, Hgb := HGB, CRP := `C-REACTIVE PROTEIN`, Age:=BLOOD_AGE)
+```
+
+# Sample  
+
+```{r sample_creation, echo=FALSE,echo=FALSE,include=FALSE}
+df_pre_filter <- df %>% filter(Age<23)
+summary1 <- df_pre_filter%>%
+  group_by(BBL_ID)%>%
+  summarise(n=n())
+cat(sprintf("total participants: %d\ntotal visits = %d\n\n",length(summary1$BBL_ID),sum(summary1$n,na.rm = T)))
+
+summary2_subjs <- df_pre_filter%>%
+  group_by(BBL_ID)%>%
+  summarise(medicalratingExclude=mean(medicalratingExclude))%>%
+  group_by(medicalratingExclude)%>%
+  summarize(n=n())
+
+cat(sprintf("Participants excluded for medical conditions: %d\n",
+            summary2_subjs$n[summary2_subjs$medicalratingExclude==1]))
+
+summary2 <- df_pre_filter%>%
+  filter(medicalrating<3)%>%
+  group_by(BBL_ID)%>%
+  summarise(n=n())
+cat(sprintf("\nAfter excluding for medical conditions:\n  total participants: %d\n  total visits = %d\n\n",length(summary2$BBL_ID),sum(summary2$n,na.rm = T)))
+
+# Ferritin removed
+ferritin_exclude <- df_pre_filter%>%
+  filter(medicalrating<3)%>%
+  filter(!is.na(Ferritin))%>%
+  mutate(ferritin_exclude=Ferritin>=358)%>%
+  group_by(ferritin_exclude)%>%
+  summarise(n=n())
+number_ferritin_excluded <- as.numeric(ferritin_exclude%>%filter(ferritin_exclude==T)%>%select(n))
+
+summary3 <- df_pre_filter%>%
+  filter(medicalrating<3)%>%
+  filter(Ferritin<=358|is.na(Ferritin))%>%
+  group_by(BBL_ID)%>%
+  summarise(n=n())
+cat(sprintf("\nAfter excluding atypical ferritin:\n total participants: %d\ntotal visits = %d\n\n",length(summary3$BBL_ID),sum(summary3$n,na.rm = T)))
+
+#### final sample ####
+df<- df_pre_filter%>%
+  filter(medicalrating<3)%>%
+  filter(Ferritin<=358|is.na(Ferritin))
+
+cat("\nFinal sample.")
+# Sample table
+lab_long <- df %>% pivot_longer(cols = c(Ferritin,Transferrin,Hgb),names_to = "Blood_Measure",values_to = "Value")
+visit_counts<-lab_long%>%
+    group_by(BBL_ID,Blood_Measure)%>%
+    summarise(n=sum(!is.na(Value)),sex=oSex[1])%>%
+    group_by(Blood_Measure)%>%
+    summarise(number_of_participants = sum(n>0),
+              number_of_visits = sum(n,na.rm = T),
+              nmales = sum(sex=="Male"&n>0),
+              nfemales = sum(sex=="Female"&n>0),
+              malefemale = sprintf("%d/%d",nmales,nfemales))
+
+ages_summary <- lab_long%>%filter(!is.na(Value))%>%
+    group_by(Blood_Measure)%>%
+    summarise(min_age=min(Age,na.rm = T),
+              max_age=max(Age,na.rm = T),
+              mean_age = mean(Age,na.rm=T),
+              sd_age = sd(Age,na.rm=T),
+              agerange = sprintf("%1.2f-%1.2f",min_age,max_age),
+              msd = sprintf("%1.2f (%1.2f)",mean_age,sd_age))
+  summary_table <- visit_counts %>%
+    full_join(ages_summary,by="Blood_Measure")
+  
+  summary_kable<-summary_table%>%select(Blood_Measure,number_of_participants,number_of_visits,malefemale,agerange,msd)%>%
+    kableExtra::kbl(caption = "<b>eTable 1. Sample demographics by iron status metric. <small></b>",
+                  col.names = c("Iron status metric",
+                                "Participants (<i>N</i>)",
+                                "Visits (<i>N</i>)", 
+                                "Male/Female",
+                                "Age range (y)",
+                                "Mean (<i>SD</i>)"),
+                  align = "l",escape = F)%>%
+     kableExtra::kable_classic(full_width=F,position="left",html_font="arial",font_size = 12)
+
+write.table(summary_table,"figs/summary_table.csv",sep = ",",row.names = F)
+
+summary_kable
+summary_kable%>%
+  kableExtra::save_kable(file = "figs/summary_table.png",zoom=3)
+
+# Get total, not broken down by metric
+visit_counts<-lab_long%>%
+    group_by(BBL_ID)%>%
+  filter(!is.na(Value))%>%
+    summarise(n=sum(!is.na(Value)),sex=oSex[1])%>%
+    summarise(number_of_participants = sum(n>0),
+              number_of_visits = sum(n,na.rm = T),
+              nmales = sum(sex=="Male"&n>0),
+              nfemales = sum(sex=="Female"&n>0),
+              malefemale = sprintf("%d/%d",nmales,nfemales))
+
+ages_summary <- lab_long%>%filter(!is.na(Value))%>%
+    summarise(min_age=min(Age,na.rm = T),
+              max_age=max(Age,na.rm = T),
+              mean_age = mean(Age,na.rm=T),
+              sd_age = sd(Age,na.rm=T),
+              agerange = sprintf("%1.2f-%1.2f",min_age,max_age),
+              msd = sprintf("%1.2f (%1.2f)",mean_age,sd_age))
+  overall_table <- visit_counts %>%
+    bind_cols(ages_summary)
+  
+  overall_kable<-overall_table%>%select(number_of_participants,number_of_visits,malefemale,agerange,msd)%>%
+    kableExtra::kbl(caption = "<b>Overall sample demographics.</b>",
+                  col.names = c("Participants (<i>N</i>)",
+                                "Visits (<i>N</i>)", 
+                                "Male/Female",
+                                "Age range (y)",
+                                "Mean (<i>SD</i>)"),
+                  align = "l",escape = F)%>%
+     kableExtra::kable_classic(full_width=F,position="left",html_font="arial",font_size = 12)
+```
+
+This sample was drawn from the  Philadelphia Neurodevelopmental Cohort (PNC). As previously described in detail, the PNC consists of 9,498 participants aged 8-22 years that underwent cognitive assessment and a subset of 1,601 youths that also completed neuroimaging(Calkins et al., 2015; Satterthwaite et al., 2014). This study used a subset of the PNC sample for which electronic medical records (EMR) of blood draws that included at least one indicator of peripheral iron status (hemoglobin, transferrin, or ferritin) were available (n = `r length(summary1$BBL_ID)`, `r sum(summary1$n,na.rm = T)` total observations). Study participants were excluded from analyses if their EMR indicated a significant or severe physical medical condition (n = `r summary2_subjs$n[summary2_subjs$medicalratingExclude==1]`). Medical condition severity was determined based on prior work in this sample(Merikangas et al., 2015). Lab results with serum ferritin levels above the normal reference range were excluded from all analyses (described below; `r number_ferritin_excluded` total observations). For participants with repeated measures, all blood draws that met inclusion criteria were included. The final sample included `r as.numeric(summary_table[summary_table$Blood_Measure=="Hgb","number_of_visits"])` hemoglobin levels from `r as.numeric(summary_table[summary_table$Blood_Measure=="Hgb","number_of_participants"])` participants, `r as.numeric(summary_table[summary_table$Blood_Measure=="Ferritin", "number_of_visits"])` ferritin levels from `r as.numeric(summary_table[summary_table$Blood_Measure=="Ferritin","number_of_participants"])` participants, and `r as.numeric(summary_table[summary_table$Blood_Measure=="Transferrin", "number_of_visits"])` transferrin levels from `r as.numeric(summary_table[summary_table$Blood_Measure=="Transferrin","number_of_participants"])` participants (see eTable1 for demographic summary statistics for each measure).  
+
+`r summary_kable`
+
+`r overall_kable`
+
+***
+
+# Results 
+
+## Part 1: Developmental effects
+### Age effects for individual blood iron measures
+
+Fitting GAMMs to model the age and sex effects for Hgb, ferritin, and transferrin.  
+
+```{r dev_plots,fig.width=12, fig.height=5,warning=FALSE,echo=FALSE,message=FALSE,cache=TRUE}
+# GAMMs
+# Hgb
+hgb_mod <- gamm4::gamm4(Hgb ~ s(Age,k=5, fx = F) + oSex + s(Age,by=oSex,k=5, fx = F),
+                        data = df,
+                        REML=TRUE,
+                        random = ~(Age|BBL_ID))
+
+summary(hgb_mod$gam)
+# generate a reduced model for partial R2
+hgb_mod_reduced <- gamm4::gamm4(Hgb ~ s(Age,k=5, fx = F) + oSex,
+                                data = df,
+                                REML=TRUE,
+                                random = ~(Age|BBL_ID))
+hgb_r2 <- partialR2(hgb_mod$gam,hgb_mod_reduced$gam) #effect size
+
+#now generate a plot. 
+ph<-visualize_model(modobj = hgb_mod, smooth_var = 'Age',int_var = 'oSex',group_var = "BBL_ID",
+                   derivative_plot = TRUE, show.data=FALSE, side_density = TRUE, show.legend = TRUE,
+                   xlabel = "Age (years)", ylabel = "Hemoglobin (g/dL)",quantile_limits = TRUE,flat_fill = T)
+save_plot('figs/chgb_development.svg',plot = ph)
+
+# Ferritin
+ferr_mod <- gamm4::gamm4(Ferritin ~ s(Age,k=5, fx = F) + oSex + s(Age,by=oSex,k=5, fx = F),
+                         data = df,REML=TRUE,
+                         random = ~(Age|BBL_ID),
+                         family = Gamma(link="log"))
+summary(ferr_mod$gam)
+ferr_mod_reduced <- gamm4::gamm4(Ferritin ~ s(Age,k=5, fx = F) + oSex,
+                         data = df,REML=TRUE,
+                         random = ~(Age|BBL_ID),
+                         family = Gamma(link="log")) #fitting with Gamma family due to distribution.
+
+ferr_r2 <- partialR2(full_mod = ferr_mod$gam,reduced_mod = ferr_mod_reduced$gam)
+
+pf<-visualize_model(modobj = ferr_mod, smooth_var = 'Age',int_var = 'oSex',group_var = "BBL_ID",
+                   derivative_plot =  TRUE,show.data = FALSE,side_density = TRUE, show.legend=FALSE,flat_fill = T,
+                   xlabel = "Age (years)",ylabel = "Ferritin (ng/mL)",quantile_limits = FALSE,quants = c(0,.95))
+save_plot('figs/cferritin_development.svg',plot = pf)
+
+# Transferrin
+Trans_mod <- gamm4::gamm4(Transferrin ~ s(Age,k=5, fx = F) + oSex + s(Age,by=oSex,k=5, fx = F),
+                          data = df,REML=TRUE,random = ~(Age|BBL_ID))
+Trans_mod_reduced <- gamm4::gamm4(Transferrin ~ s(Age,k=5) + oSex,
+                          data = df,REML=TRUE,random = ~(Age|BBL_ID))
+summary(Trans_mod$gam)
+trans_r2 <- partialR2(Trans_mod$gam,Trans_mod_reduced$gam)
+
+pt<-visualize_model(modobj = Trans_mod, smooth_var = 'Age',int_var = 'oSex',group_var = "BBL_ID", 
+                   derivative_plot = TRUE, show.data = FALSE, side_density = TRUE, show.legend=FALSE,
+                   xlabel = "Age (years)",ylabel = "Transferrin (mg/dL)",quantile_limits = TRUE,flat_fill = TRUE)
+save_plot('figs/cTransferrin_development.svg',plot = pt)
+
+pgrid_dev <- plot_grid(plotlist = list(ph,pf,pt),nrow = 1)
+pgrid_dev
+save_plot(filename = "figs/developmental_plots.svg",pgrid_dev,base_height = 5,base_width = 15)
+
+## Regression table
+regression_table <- rbind(
+    tidy(hgb_mod$gam),
+    tidy(ferr_mod$gam),
+    tidy(Trans_mod$gam))%>%
+  select(-ref.df)
+Formatted_regression_table <- regression_table%>%
+  mutate(p2 = case_when(p.value <.001 ~ "< .001",
+                            p.value>.001 ~ str_remove(as.character(round(p.value,digits = 3)),"0+")))%>%
+  select(-p.value)%>%
+  kbl(caption = "<b>Regression table for developmental models.</b>",
+      digits = c(1,1,1,3),
+      col.names = c("Term","<i>edf</i>","<i>F</i>","<i>P</i>"),
+      align = "lccc",
+      escape = F)%>%
+  pack_rows("Hgb",1,2,)%>%pack_rows("Ferritin",3,4)%>%pack_rows("Transferrin",5,6)%>%
+  footnote(general = c("<code>s(Age)</code>: Smooth effect of Age in males.",
+                       "<code>s(Age):oSexFemale </code>: Smooth deviation from males for females."),
+           escape = F)%>%
+  kable_classic(full_width=F,position="left",html_font = "arial",font_size=12)
+Formatted_regression_table
+  
+## multiple comparisons
+result_table <- regression_table%>%
+  filter(str_detect(term,":"))%>%
+  mutate(Metric = c("Hgb","Ferritin","Transferrin"),
+         fdr.p = p.adjust(p.value,method = "fdr"),
+          partialr2 = c(hgb_r2,ferr_r2,trans_r2))
+Formatted_table <- format_regression_table(input_table = result_table,
+                                           caption = "<b>eTable 2. Regression table for age-by-sex interaction</b>.")
+Formatted_table
+  
+## Supplementary material
+Formatted_table %>% kableExtra::save_kable(file = "figs/development_table_mc.png",zoom=3)
+Formatted_regression_table %>% kableExtra::save_kable(file = "figs/development_table.png",zoom=3)
+```
+
+### Puberty effects in females
+We saw a divergence in the developmental effects around the onset of adolescence between males and females. A possible cause of this sex difference is the effect of menstruation on the body's iron status. To test this hypothesis, we look at the same metrics in females relative to the self-reported onset of menarche.  
+
+If our hypothesis is correct, we should see nonlinear effects such that the slope of Hgb by age differs pre and post menarche.  In the regression models below, `age_menarche_centered` is age in years recentered on the self-reported age of menarche in female participants.    
+
+```{r puberty, fig.height=3.5,fig.width=10,warning=FALSE, echo=FALSE}
+# data organization
+df_puberty <- df %>%
+  filter(!(tanner_girl_3==2&Age>COG_AGE_timepoint1))%>% #we can't use data where they may have entered menarche subsequent to tanner assessment (for blood measures that occur after the cognitive/tanner visit).
+  mutate(age_menarche_centered = Age - menarche_age,
+         oSex = ordered(sex,levels=c(1,2),labels = c("Male","Female"))) #Just organizing the variables for the models.
+
+df_puberty %>% group_by(BBL_ID)%>%
+  filter(age_menarche_centered>-10&age_menarche_centered<=10)%>% #there is very sparse coverage outside this range.
+  summarise(n=sum(!is.na(Hgb)&!is.na(age_menarche_centered)))%>%
+  summarise(num_participants = sum(n>0),num_visits=sum(n))%>%
+  kableExtra::kbl(caption = "Obervations for menarche analyses")%>%kable_classic(full_width=F)
+
+
+# Modeling
+## age relative to menarche
+### Hgb
+hgb_mod <- gamm4::gamm4(Hgb ~ s(age_menarche_centered,k=5,fx=F) ,
+                        data = df_puberty,REML=TRUE,
+                        random = ~(age_menarche_centered|BBL_ID), #random intercept and slope
+                        subset = age_menarche_centered>-10&age_menarche_centered<=10)
+summary(hgb_mod$gam)
+hgb_mod_reduced <- gamm4::gamm4(Hgb ~ 1,
+                        data = df_puberty,REML=TRUE,
+                        random = ~(age_menarche_centered|BBL_ID), #random intercept and slope
+                        subset = age_menarche_centered>-10&age_menarche_centered<=10)
+hgb_pr2 <- partialR2(hgb_mod,hgb_mod_reduced)
+ph<-visualize_model(modobj = hgb_mod$gam,smooth_var = "age_menarche_centered",group_var = "BBL_ID",
+                   show.data = FALSE,derivative_plot = TRUE,side_density = TRUE,
+                   quantile_limits = TRUE,quants = c(.1,.9),flat_fill = TRUE,
+                   line_color = scales::muted('red',l=60,c=80),
+                   xlabel = "Years from menarche",ylabel="Hemoglobin (g/dL)")
+save_plot('figs/chgb_menarche.svg',plot = ph,base_height = 5,base_width = 4.5)
+
+#Ferritin
+fer_mod <- gamm4::gamm4(Ferritin ~ s(age_menarche_centered,k=5,fx=F) ,
+                        data = df_puberty,REML=TRUE,
+                        random = ~(age_menarche_centered|BBL_ID),
+                        family = Gamma(link="log"),
+                        subset = age_menarche_centered>-10&age_menarche_centered<=10)
+summary(fer_mod$gam)
+fer_mod_reduced <- gamm4::gamm4(Ferritin ~ 1 ,
+                        data = df_puberty,REML=TRUE,
+                        random = ~(age_menarche_centered|BBL_ID),
+                        family = Gamma(link="log"),
+                        subset = age_menarche_centered>-10&age_menarche_centered<=10)
+fer_pr2 <- (deviance(fer_mod_reduced$mer)-deviance(fer_mod$mer))/deviance(fer_mod_reduced$mer) # get partial deviance since we have gamma family.
+
+pf<-visualize_model(modobj = fer_mod,smooth_var = "age_menarche_centered",group_var = "BBL_ID",
+                   show.data = FALSE,derivative_plot = TRUE,side_density = TRUE, show.legend = FALSE,
+                   quantile_limits = TRUE,quants = c(0,.95),flat_fill = TRUE,
+                   line_color = scales::muted('red',l=60,c=80),
+                   xlabel = "Years from menarche",ylabel = "Ferritin (ng/mL)")
+save_plot('figs/cferritin_menarche.svg',plot = pf,base_height = 5,base_width = 4.5)
+
+#Transferrin
+Trans_mod <- gamm4::gamm4(Transferrin ~ s(age_menarche_centered,k=5,fx=F) ,
+                          data = df_puberty,
+                          REML=TRUE,
+                          random = ~(age_menarche_centered|BBL_ID),
+                          subset = age_menarche_centered>-10&age_menarche_centered<=10)
+summary(Trans_mod$gam)
+Trans_mod_reduced <-  gamm4::gamm4(Transferrin ~ 1,
+                          data = df_puberty,
+                          REML=TRUE,
+                          random = ~(age_menarche_centered|BBL_ID),
+                          subset = age_menarche_centered>-10&age_menarche_centered<=10)
+Trans_pr2 <- partialR2(Trans_mod,Trans_mod_reduced)
+pt<-visualize_model(modobj = Trans_mod$gam,smooth_var = "age_menarche_centered",group_var = "BBL_ID",
+                   show.data = FALSE, derivative_plot = TRUE,side_density = TRUE, show.legend = FALSE,
+                   quantile_limits = TRUE, flat_fill = TRUE,
+                   line_color = scales::muted('red',l=60,c=80),
+                   xlabel= "Years from menarche",ylabel = "Transferrin (mg/dL)")
+save_plot('figs/cTransferrin_menarche.svg',plot = pt,base_height = 5,base_width = 4.5)
+
+pgrid <- plot_grid(plotlist = list(ph,pf,pt),nrow = 1)
+print(pgrid)
+save_plot(filename = "figs/menarche_plots.svg",pgrid,base_height = 4.66,base_width = 15)
+
+## multiple comparisons
+regression_table <- rbind(
+  tidy(hgb_mod$gam),
+  tidy(fer_mod$gam),
+  tidy(Trans_mod$gam))
+
+result_table <- regression_table%>%
+  mutate(Metric = c("Hgb","Ferritin","Transferrin"),
+         fdr.p = p.adjust(p.value,method = "fdr"),
+          partialr2 = c(hgb_pr2,fer_pr2,Trans_pr2))
+Formatted_table <- format_regression_table(input_table = result_table,
+                                           caption = "<b>eTable 3. Association between iron status measures and menarche timing.")
+Formatted_table
+
+## Supplementary material -- not needed
+# dhgb <- draw(hgb_mod$gam,residuals=TRUE,guides = "collect")+plot_layout(nrow=1,ncol=3)&theme(plot.title = element_blank())
+# dfer <- draw(fer_mod$gam,residuals=TRUE)+plot_layout(nrow=1,ncol=1)&theme(plot.title = element_blank())
+# dtrans <- draw(Trans_mod$gam,residuals=TRUE)+plot_layout(nrow=1,ncol=1)&theme(plot.title = element_blank())
+# supplementary_figure2 <- dhgb/dfer/dtrans +plot_layout(nrow=3)
+# save_plot(filename = "figs/supplementary_figure2.svg",supplementary_figure2,base_height = 18,base_width = 12)
+Formatted_table %>% kableExtra::save_kable(file = "figs/menarche_table.png",zoom=3)
+```
+
+## Socioeconomic status
+Next, we investigate whether the neighborhood socioeconomic status (based on geocoded data) was associated with iron status.  
+
+### Main effects
+Does iron status vary by SES, irrespective of age and sex?  
+
+```{r ses_main, echo = FALSE,cache=TRUE}
+# models
+# Hgb
+
+# Ses and age
+hgb_mod <- gamm4::gamm4(Hgb ~ oSex + s(Age,k=5)+ 
+                          s(Age,by=oSex,k=5)+
+                          s(envSES,k=4),
+                        data = df,
+                        REML=TRUE,
+                        random = ~(Age|BBL_ID))
+summary(hgb_mod$gam)
+hgb_mod_reduced <- gamm4::gamm4(Hgb ~ oSex + 
+                                  s(Age,k=5)+ 
+                                  s(Age,by=oSex,k=5),
+                        data = df,
+                        REML=TRUE,
+                        random = ~(Age|BBL_ID))
+hgb_r2 <- partialR2(full_mod = hgb_mod$gam,reduced_mod = hgb_mod_reduced$gam)
+
+#Ferritin
+ferr_mod <- gamm4::gamm4(Ferritin ~ oSex + 
+                           s(Age,k=5)+ 
+                           s(Age,by=oSex,k=5)+
+                           s(envSES,k=4),
+                        data = df,
+                        REML=TRUE,
+                        family = Gamma(link="log"),
+                        random = ~(Age|BBL_ID))
+summary(ferr_mod$gam)
+# ferr_mod_reduced <- gamm4::gamm4(Ferritin ~ oSex + 
+#                            s(Age,k=5)+ 
+#                            s(Age,by=oSex,k=5),
+#                         data = df,
+#                         REML=TRUE,
+#                         family = Gamma(link="log"),
+#                         random = ~(Age|BBL_ID))
+# ferr_r2 <- partialR2(full_mod = ferr_mod$gam,reduced_mod = ferr_mod_reduced$gam)
+
+#Transferrin
+trans_mod <- gamm4::gamm4(Transferrin ~ oSex + 
+                            s(Age,k=5)+ 
+                            s(Age,by=oSex,k=5)+
+                            s(envSES,k=4),
+                        data = df,
+                        REML=TRUE,
+                        random = ~(Age|BBL_ID))
+summary(trans_mod$gam)
+# trans_mod_reduced <- gamm4::gamm4(Transferrin ~ oSex + 
+#                             s(Age,k=5)+ 
+#                             s(Age,by=oSex,k=5),
+#                         data = df,
+#                         REML=TRUE,
+#                         random = ~(Age|BBL_ID))
+# trans_r2 <- partialR2(full_mod = trans_mod$gam,reduced_mod = trans_mod_reduced$gam)
+
+# Only hgb is significant.
+## multiple comparisons
+result_table <- rbind(
+  tidy(hgb_mod$gam),
+  tidy(ferr_mod$gam),
+  tidy(trans_mod$gam))%>%
+  filter(term=="s(envSES)")%>%
+   mutate(fdr.p =p.adjust(p.value,method = "fdr"))%>%
+  kableExtra::kbl()%>%
+  kableExtra::kable_classic_2()
+
+result_table
+# ## Supplementary material
+# dhgb <- draw(hgb_mod$gam,residuals=TRUE)+plot_layout(nrow = 1,ncol=3)&theme(plot.title = element_blank())
+# dfer <- draw(ferr_mod$gam,residuals=TRUE)+plot_layout(nrow = 1,ncol=3)&theme(plot.title = element_blank())
+# dtrans <- draw(trans_mod$gam,residuals=TRUE)+plot_layout(nrow = 1,ncol=3)&theme(plot.title = element_blank())
+# supplementary_figure3 <- dhgb/dfer/dtrans + plot_layout(nrow=3)
+# save_plot(filename = "figs/supplementary_figure_ses_3.svg",supplementary_figure3,base_height = 18,base_width = 18)
+```
+
+### Interaction effects
+We observed a significant effect of SES for Hgb. Now, we test whether SES moderates the developmental trajectory of iron status in males and females. Due to the complexity of a three-way interaction GAMM, males and females were modeled separately:   
+`Hgb ~ ti(envSES) + ti(Age)+ ti(envSES,Age)` for males and females separately.  
+
+```{r ses_int, echo = FALSE, fig.width=10,cache=T, cache.vars=c("hgb_modif","hgb_modif_reduced","hgb_modim","hgb_modim_reduced")}
+# Ses and age interaction 
+# Female
+hgb_modif <- gamm(Hgb ~ s(envSES,k=4, fx = F) + s(Age,k=5, fx = F)+ ti(envSES,Age,k=4, fx = F),
+  data = df,
+  REML=TRUE,
+  random = list(BBL_ID=~1+Age),
+  subset = oSex=="Female")
+hgb_modif_reduced <- gamm(Hgb ~ s(envSES,k=4, fx = F) + s(Age,k=5, fx = F),
+  data = df,
+  REML=TRUE,
+  random = list(BBL_ID=~1+Age),
+  subset = oSex=="Female")
+female_r2 <- partialR2(full_mod = hgb_modif$gam,reduced_mod = hgb_modif_reduced$gam)
+summary(hgb_modif$gam)
+
+# Male
+hgb_modim <- gamm(Hgb ~ s(envSES,k=4, fx = F) + s(Age,k=5, fx = F)+ ti(envSES,Age,k=4, fx = F),
+  data = df,
+  REML=TRUE,
+  random = list(BBL_ID=~1+Age),
+  subset = oSex=="Male")
+hgb_modim_reduced <- gamm(Hgb ~ s(envSES,k=4, fx = F) + s(Age,k=5, fx = F),
+  data = df,
+  REML=TRUE,
+  random = list(BBL_ID=~1+Age),
+  subset = oSex=="Male")
+male_r2 <- partialR2(full_mod = hgb_modim$gam,reduced_mod = hgb_modim_reduced$gam)
+summary(hgb_modim$gam)
+
+# comparison correction for males and females
+result_table <- rbind(
+  tidy(hgb_modim$gam),
+  tidy(hgb_modif$gam))%>%
+  filter(term=="ti(envSES,Age)")%>%
+   mutate(fdr.p =p.adjust(p.value,method = "fdr"))%>%
+  mutate(partialR2=c(male_r2,female_r2))%>%
+  kableExtra::kbl()%>%
+  kableExtra::kable_classic_2()
+
+male_ses <-visualize_model(hgb_modim,smooth_var = "Age",int_var = "envSES",
+                show.data = FALSE,group_var = "BBL_ID",quantile_limits = TRUE, side_density = TRUE,
+                xlabel="Age (years)", ylabel="Hemoglobin (g/dL)",plabels = "Males",show.legend = FALSE)
+
+female_ses<- visualize_model(hgb_modif,smooth_var = "Age",int_var = "envSES",
+                show.data = FALSE,group_var = "BBL_ID",quantile_limits = TRUE, side_density = TRUE,
+                xlabel="Age (years)",plabels = "Females",show.legend = FALSE)
+
+pgrid <- plot_grid(plotlist = list(male_ses,female_ses),nrow = 1,align = "v")
+print(pgrid)
+save_plot(filename = "figs/ses_interaction_plots.svg",pgrid,base_height = 4,base_width = 8)
+
+# # plot all together-- this was not included in the manuscript.  
+new_data <- tidyr::expand(hgb_modim$gam$model, envSES=c(1,-1.55),
+                         Age = seq(from = min(Age,na.rm = T),to = max(Age,na.rm = T),by = .05))
+m1_pred <- bind_cols(new_data,
+                     as.data.frame(predict(hgb_modim$gam, newdata = new_data,
+                                           se.fit = TRUE)))
+new_data <- tidyr::expand(hgb_modif$gam$model, envSES=c(1,-1.55),
+                          Age = seq(from = min(Age,na.rm = T),to = max(Age,na.rm = T),by = .05))
+m2_pred <- bind_cols(new_data,
+                     as.data.frame(predict(hgb_modif$gam, newdata = new_data,
+                                           se.fit = TRUE)))
+m1_pred$model="Male"
+m2_pred$model="Female"
+all_pred = rbind(m1_pred,m2_pred)%>%
+  mutate(lwr=fit-1.96*se.fit,upr=fit+1.96*se.fit)%>%
+  mutate(SES = factor(envSES,levels = c(1,-1.55),labels = c("High SES","Low SES")))
+
+hgb_ses_plot <- ggplot(all_pred,aes(x=Age,y=fit,color=model,fill=model,linetype=SES,ymin=lwr,ymax=upr)) +
+  geom_line(size=line_size) + geom_ribbon(alpha=.25)+
+  scale_linetype_manual(values = c("High SES"= "solid", "Low SES" = "dotted"))+
+  scale_color_manual(values = c("Male"=scales::muted('blue',l=60,c=80),"Female"=scales::muted('red',l=60,c=80))) +
+  scale_fill_manual(values = c("Male"=scales::muted('blue',l=60,c=80),"Female"=scales::muted('red',l=60,c=80))) +
+  theme(legend.title = element_blank()) +
+  ylab("Hgb") + xlab("Age (years)")
+save_plot("Figs/SES_sex_Hgb.svg",plot = hgb_ses_plot)
+print(hgb_ses_plot)
+print(result_table)
+
+
+```
+
+## Part 2: Cogntion
+### Test the association between cognitive data and the individual blood iron measures
+This association was testing using GAMs that co-vary for age and sex. e.g.  
+`gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE) +  s(Hgb), data = Hgb,method = "REML")`  
+
+```{r cog_sample,echo=FALSE,message=FALSE}
+time_diff = .5
+## Hgb
+Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff)
+ferritin <- match_cognition_and_blood(df=df,blood_measure = "Ferritin",time_diff = time_diff)
+transferrin <- match_cognition_and_blood(df=df,blood_measure = "Transferrin",time_diff = time_diff)
+allcog=full_join(Hgb,transferrin)%>%full_join(ferritin)%>%
+  pivot_longer(cols = c("Hgb","Ferritin","Transferrin"),names_to = "Blood_Measure",values_to = "Value")%>%
+  mutate(total = "Total")
+by_metric <- allcog %>% group_by(Blood_Measure)%>%
+  filter(!is.na(Value))%>%
+  summarise(min_age = min(COG_AGE),
+                  max_age=max(COG_AGE),
+                  mean_age=mean(COG_AGE),
+                  sd_age=sd(COG_AGE),
+                  n=sum(!is.na(Value)),
+                  nmale=sum(!is.na(Value)&oSex=="Male"),
+                  nfemale=sum(!is.na(Value)&oSex=="Female"),
+                  malefemale = sprintf("%d/%d",nmale,nfemale),
+                  agerange = sprintf("%1.2f-%1.2f",min_age,max_age),
+                  msd = sprintf("%1.2f (%1.2f)",mean_age,sd_age))%>%
+  select(Blood_Measure,n,malefemale,agerange,msd)
+
+totals <- allcog %>% mutate(Blood_Measure=total)%>%group_by(Blood_Measure)%>%
+  filter(!is.na(Value))%>%
+  summarise(min_age = min(COG_AGE),
+                  max_age=max(COG_AGE),
+                  mean_age=mean(COG_AGE),
+                  sd_age=sd(COG_AGE),
+                  n=sum(!is.na(Value)),
+                  nmale=sum(!is.na(Value)&oSex=="Male"),
+                  nfemale=sum(!is.na(Value)&oSex=="Female"),
+                  malefemale = sprintf("%d/%d",nmale,nfemale),
+                  agerange = sprintf("%1.2f-%1.2f",min_age,max_age),
+                  msd = sprintf("%1.2f (%1.2f)",mean_age,sd_age))%>%
+  select(Blood_Measure,n,malefemale,agerange,msd)
+
+by_metric%>%bind_rows(totals)%>%
+  kableExtra::kbl(caption = "<b>Demographics table for cognitive models</b>",
+                  col.names = c("Metric","<i>N</i>", "Male/Female","Age range","Mean (<i>SD</i>)"),
+                  align = "l",escape = F)%>%
+  kableExtra::kable_classic(full_width=F,position="left")
+
+```
+ Participants who had at least one iron status metric within six months prior to participation in the PNC were also included in cognitive ($n$ = `r totals$n`; male/female = `r totals$malefemale`; ages `r totals$agerange`y, $M (SD)$ = `r totals$msd`).  
+ 
+#### Hemoglobin
+```{r indiv_blood_cog_measures,warning=FALSE,fig.height=6,eval=TRUE,echo=FALSE, message=FALSE}
+time_diff = .5 #(.5 years)
+## Hgb
+Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff)
+
+### Overall accuracy
+gmod <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE) +  s(Hgb,k=4), data = Hgb,method = "REML")
+gmod_reduced <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE, sp = gmod$sp[1]), data = Hgb ,method = "REML")
+partialR2(gmod,gmod_reduced)
+dhgb <- draw(gmod,residuals=TRUE)+plot_layout(nrow = 1,ncol=2)&theme(plot.title = element_blank())
+hcog<-gmod
+summary(gmod)
+p <- visualize_model(gmod,smooth_var = "Hgb",side_density = FALSE,show.data = TRUE, 
+                     xlabel = "Hemoglobin (g/dL)",ylabel = "Overall Accuracy (z)")
+print(p)
+hgb_cog <- p
+save_plot(filename = "figs/hgb_cognition.svg",plot = p,base_width = 4)
+
+### Overall is sig. Now check sub-domains:
+cat("Now testing cognitive subdomains of Executive, Social, and Memory.\n")
+Hgb_long <- Hgb %>% pivot_longer(cols = starts_with("NAR")&contains("Accuracy")&!contains("Overall"),names_to="CogMeasure")
+model_df <- Hgb_long %>%
+  group_by(CogMeasure)%>%
+  do(fit_tract = tidy(gam(value ~ sex + s(COG_AGE,fx = T) + s(Hgb,k=4, fx = F), data = .,method = "REML"))) %>%
+  unnest(fit_tract)
+Hgbresults <- model_df %>%
+  filter(term == 's(Hgb)')%>%
+  mutate(fdr.p = p.adjust(p.value,method = "fdr"))
+result_df <- Hgb_long %>%
+    group_by(CogMeasure)%>%
+    do(partialr2 = model_effects(gam(value ~ sex + s(COG_AGE,fx = T) + s(Hgb,k=4, fx = F), data = .,method = "REML")))%>%
+  unnest(partialr2)%>%
+  left_join(Hgbresults)%>%
+  mutate(Metric = factor(CogMeasure,
+                         levels = c("NAR_F1_Exec_Comp_Cog_Accuracy",
+                                    "NAR_F2_Social_Cog_Accuracy",
+                                    "NAR_F3_Memory_Accuracy"),
+                         labels = c("Executive","Social","Memory")))
+formatted_table <- format_regression_table(result_df,caption = "<b>eTable 4. Association between hemoglobin and cognitive subdomains.</b>")
+formatted_table
+formatted_table %>% save_kable("figs/hgb_cognition_results.png",zoom=3)
+write.csv(x=result_df,file = "figs/hgb_cognition_results.csv",row.names = F)
+```
+
+#### Ferritin
+```{r ferritin_cog,warning=FALSE,fig.height=6,eval=TRUE,echo=FALSE, message=FALSE}
+## Ferritin
+gmod <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE,fx = F)+ s(Ferritin,k=4, fx = F), data = ferritin)
+summary(gmod)
+model_effects(gmod)
+dfer <- draw(gmod,residuals=TRUE)+plot_layout(nrow = 1,ncol=2)&theme(plot.title = element_blank())
+fcog<-gmod
+fplot <- visualize_model(gmod,smooth_var = "Ferritin", xlabel = "Ferritin (ng/mL)",ylabel = "Overall Accuracy (z)")
+print(fplot)
+### Checking each individual accuracy factor
+FER_long <- ferritin %>% pivot_longer(cols = starts_with("NAR")&contains("Accuracy")&!contains("Overall"),names_to="CogMeasure")
+model_df <- FER_long %>%
+  group_by(CogMeasure)%>%
+  do(fit_tract = tidy(gam(value ~ s(COG_AGE,fx = F) +sex + s(Ferritin,k=4, fx = F), data = .))) %>%
+  unnest(fit_tract) # fitting models
+FERresults <- model_df %>%
+  filter(term == 's(Ferritin)')%>%
+  mutate(fdr.p = p.adjust(p.value,method = "fdr"))%>%
+  mutate(sig = factor(fdr.p<.05),sig_uncorrected = factor(p.value<.05)) #pulling out relevant stats
+result_df <- FER_long %>%
+    group_by(CogMeasure)%>%
+    do(partialr2 = model_effects(gam(value ~ sex + s(COG_AGE,fx = T) + s(Ferritin,k=4, fx = F), data = .,method = "REML")))%>%
+  unnest(partialr2)%>%
+  left_join(FERresults)%>%
+  mutate(Metric = factor(CogMeasure,
+                         levels = c("NAR_F1_Exec_Comp_Cog_Accuracy",
+                                    "NAR_F2_Social_Cog_Accuracy",
+                                    "NAR_F3_Memory_Accuracy"),
+                         labels = c("Executive","Social","Memory")))
+formatted_table <- format_regression_table(result_df,caption = "<b>eTable 5. Association between ferritin and cognitive subdomains.</b>")
+formatted_table
+formatted_table %>% save_kable("figs/ferritin_cognition_results.png",zoom=3)
+```
+
+#### Transferrin
+```{r transferrin_cog,warning=FALSE,fig.height=6,eval=TRUE,echo=FALSE, message=FALSE}
+## Transferrin 
+gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE, fx = F)+sex + s(Transferrin, k=4, fx = F) , data = transferrin)
+summary(gmod)
+model_effects(gmod)
+dtrans <- draw(gmod,residuals=TRUE)+plot_layout(nrow = 1,ncol=2)&theme(plot.title = element_blank())
+tcog<-gmod
+tplot <- visualize_model(gmod,smooth_var = "Transferrin", xlabel = "Transferrin (mg/dL)",ylabel = "Overall Accuracy (z)")
+print(tplot)
+
+T_long <- transferrin %>% pivot_longer(cols = starts_with("NAR")&contains("Accuracy")&!contains("Overall"),names_to="CogMeasure")
+model_df <- T_long %>%
+  group_by(CogMeasure)%>%
+  do(fit_tract = tidy(gam(value ~ s(COG_AGE, fx = F)+sex + s(Transferrin, k = 4, fx = F), data = .,method = "REML"))) %>%
+  unnest(fit_tract)
+Tresults <- model_df %>%
+  filter(term == 's(Transferrin)')%>%
+  mutate(fdr.p = p.adjust(p.value,method = "fdr"))%>%
+  mutate(sig = factor(fdr.p<.05),sig_uncorrected = factor(p.value<.05))
+result_df <- T_long %>%
+    group_by(CogMeasure)%>%
+    do(partialr2 = model_effects(gam(value ~ sex + s(COG_AGE,fx = T) + s(Transferrin,k=4, fx = F), data = .,method = "REML")))%>%
+  unnest(partialr2)%>%
+  left_join(Tresults)%>%
+  mutate(Metric = factor(CogMeasure,
+                         levels = c("NAR_F1_Exec_Comp_Cog_Accuracy",
+                                    "NAR_F2_Social_Cog_Accuracy",
+                                    "NAR_F3_Memory_Accuracy"),
+                         labels = c("Executive","Social","Memory")))
+formatted_table <- format_regression_table(result_df,caption = "<b>eTable 6. Association between transferrin and cognitive subdomains.</b>")
+formatted_table
+
+# comparison correction for overall accuracy
+result_table <- rbind(
+  tidy(hcog),
+  tidy(fcog),
+  tidy(tcog))%>%
+  filter(grepl("Ferritin|Transferrin|Hgb",term))%>%
+   mutate(fdr.p =p.adjust(p.value,method = "fdr"))%>%
+  kableExtra::kbl()%>%
+  kableExtra::kable_classic_2()
+
+## Supplementary material
+supplementary_figure5 <- p/fplot/tplot + plot_layout(nrow=3)
+save_plot(filename = "figs/supplementary_figure_cog.svg",supplementary_figure5,base_height = 12,base_width = 5)
+
+formatted_table %>% save_kable("figs/transferrin_cognition_results.png",zoom=3)
+
+```
+
+
+### Hemoglobin: a deeper dive into the cognitive effects.
+Since only Hgb is significantly associated with cognition, the next step is to see if this differs by:  
+1. Sex  
+2. Whether you include cases in the clinical range for iron deficiency or not.  
+
+#### Within sex effects of Hgb on cognition.  
+This is to see if hgb is dimensionally associated with cog irrespective of sex.  
+First, test for an age-by-sex interaction.  
+Then, test males and females separately.  
+
+```{r indiv_blood_cog_measures_threshold_sex,warning=FALSE,fig.height=4,fig.width=4,echo=FALSE,message=FALSE}
+time_diff = .5
+Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff)
+
+# First check for an age*sex interaction. This makes the most sense to answer this question.
+hgb_gmod <- gam(NAR_Overall_Accuracy ~ oSex+ s(Hgb,k=4) + s(COG_AGE) +s(Hgb,by=oSex,k=4), data = Hgb)
+r2=model_effects(hgb_gmod)
+summary(hgb_gmod)# it is not significant
+visualize_model(hgb_gmod,smooth_var = "Hgb",int_var = "oSex",show.data = F,side_density = T,
+                ylabel = "Overall Accuracy (z)",xlabel = "Hemoglobin (g/dL)",plabels = "No age-by-sex interaction")
+
+
+# To confirm, look at sexes separately.
+# Males
+hgb_gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE) + s(Hgb,k=4), data = Hgb,subset = oSex=="Male")
+maleR2 = data.frame(term="s(Hgb)", partialr2=model_effects(hgb_gmod))
+
+# Females
+hgb_gmod_female <- gam(NAR_Overall_Accuracy ~ s(COG_AGE) + s(Hgb,k=4), data = Hgb,subset = oSex=="Female")
+femaleR2 = data.frame(term="s(Hgb)", partialr2=model_effects(hgb_gmod_female))
+
+options(knitr.kable.NA = '')
+rbind(tidy(hgb_gmod)%>%left_join(maleR2),tidy(hgb_gmod_female)%>%left_join(femaleR2))%>%
+  relocate(partialr2,.after = statistic)%>%
+  kableExtra::kbl(caption = "Hgb and cognition separated by sex.",digits = c(1,1,1,1,3,3))%>%
+  pack_rows("Males",1,2,)%>%pack_rows("Females",3,4)%>%
+  kableExtra::kable_classic(html_font = "Arial",font_size=12,full_width=FALSE)
+```
+
+#### Mediation analysis
+This is looking at sex differences in cognition with and without accounting for hemoglobin differences. The hypothesis is that females cognitive performance is negatively impacted by a greater likelihood of low Hgb levels relative to males.  
+
+There is a significant age-by-sex interaction for overall cognitive performance that essentially disappears when controlling for hemoglobin. This suggests a mediation effect.    
+
+```{r hgb_mediation part 1,fig.height=4,fig.width=4,eval=TRUE,warning=FALSE,echo=FALSE}
+nohgb_gmod <- gam(NAR_Overall_Accuracy ~s(COG_AGE)+oSex+s(COG_AGE,by=oSex), data = Hgb) #just plain sex effects controlling for age.
+# nohgb_gmod <- gam(NAR_Overall_Accuracy ~s(COG_AGE,k=4)+oSex, data = Hgb) #just plain sex effects controlling for age.
+summary(nohgb_gmod)
+# plot_model(nohgb_gmod,type = "pred",show.data = T,terms = "Hgb")
+p <- visualize_model(nohgb_gmod, smooth_var = "COG_AGE", int_var = "oSex",
+                     show.data = FALSE,side_density = FALSE,quantile_limits = TRUE,
+                     xlabel = "Age (y)",ylabel = "Overall Accuracy (z)")
+print(p)
+save_plot(plot = p, filename = "figs/Age_sex_Accuracy_noHgb_correction.svg")
+
+# Now add Hgb to the model.
+hgb_gmod <- gam(NAR_Overall_Accuracy ~ s(Hgb,k=4) + s(COG_AGE)+oSex+s(COG_AGE,by=oSex), data = Hgb)
+summary(hgb_gmod)
+# plot_model(hgb_gmod,type = "pred",show.data = T,terms = "Hgb")
+p2 <- visualize_model(hgb_gmod, smooth_var = "COG_AGE", int_var = "oSex",
+                      show.data = FALSE,side_density = F,quantile_limits = TRUE,
+                      xlabel = "Age (y)",ylabel = "Overall Accuracy (z)",plabels = "After including Hgb")
+print(p2)
+save_plot(plot = p2, filename = "figs/Age_sex_Accuracy_Hgb_corrected.svg")
+```
+
+We know that sex effects for hemoglobin emerge during puberty, and the above plots suggest that accounting for hemoglobin differences reduces sex differences in cognition post-puberty. These patterns suggest a moderated mediation effect. I.e. The mediating effect of Hgb on `cogntion~sex` changes with age.  
+
+We can do this in two ways. First, we can examine the mediation effect at age 10y and age 18y. Second, we can directly test the difference in the mediation effect at ages 10y and 18y.  
+
+All mediation testing is done using non-parametric bootstrapping (`sims = 10000`) and bias corrected and accelerated confidence intervals (`boot.ci.type = "bca"`).  
+
+##### Mediation effect at age 10y:  
+
+```{r hgb_mediation age10,echo=FALSE,cache=TRUE,fig.height=3,fig.width=3}
+## Now check moderated mediation (does the mediation effect depend on age). We have to use `lm` rather than `gam` for this due to the interaction models.
+# Mediator pathway (a)
+fit_mediator <- lm(Hgb ~ COG_AGE*oSex,data = Hgb)
+
+# indirect path (b)
+fit_indirect <- lm(NAR_Overall_Accuracy ~ COG_AGE*Hgb+COG_AGE*oSex,data = Hgb)
+
+results_10 = mediation::mediate(fit_mediator, fit_indirect, treat='oSex', mediator='Hgb', 
+                             covariates = list(COG_AGE=10),boot=T,sims = 10000,boot.ci.type = "bca")
+summary(results_10)
+plot(results_10)
+```
+
+##### Mediation effect at age 18y:  
+
+```{r hgb_mediation age18, echo=FALSE,cache=TRUE,cache.vars=c("results_18"),fig.height=3,fig.width=3}
+results_18 = mediation::mediate(fit_mediator, fit_indirect, treat='oSex', mediator='Hgb', 
+                             covariates = list(COG_AGE=18),boot=T,sims = 10000,boot.ci.type = "bca")
+summary(results_18)
+plot(results_18)
+```
+
+##### Difference between the magnitude of ACME at 18y and 10y:  
+
+```{r hgb_mediation difference, echo=FALSE, cache = TRUE,cache.vars=c("med.init")}
+# difference
+med.init <- mediation::mediate(fit_mediator, fit_indirect, treat='oSex', mediator='Hgb',sims = 10000,boot.ci.type = "bca")
+mediation::test.modmed(med.init,covariates.1 = list(COG_AGE=18),covariates.2 = list(COG_AGE=10))
+```
+
+
+```{r hgb_mediation figure, echo=FALSE}
+nohgb_gmod <- gam(NAR_Overall_Accuracy ~s(COG_AGE)+oSex+s(COG_AGE,by=oSex), data = Hgb)
+hgb_gmod <- gam(NAR_Overall_Accuracy ~ s(Hgb,k=4) + s(COG_AGE)+oSex+s(COG_AGE,by=oSex), data = Hgb)
+new_data <- tidyr::expand(nohgb_gmod$model, nesting(oSex),
+                          COG_AGE = c(10,18))
+m1_pred <- bind_cols(new_data,
+                     as.data.frame(predict(nohgb_gmod, newdata = new_data,
+                                           se.fit = TRUE)))
+new_data <- tidyr::expand(hgb_gmod$model, nesting(oSex),
+                          COG_AGE = c(10,18), Hgb = mean(Hgb))
+m2_pred <- bind_cols(new_data,
+                     as.data.frame(predict(hgb_gmod, newdata = new_data,
+                                           se.fit = TRUE)))
+m1_pred$model="Unmediated"
+m2_pred$model="Hgb mediated"
+all_pred = rbind(m1_pred,m2_pred%>%select(-Hgb))%>%
+  mutate(lwr=fit-1.96*se.fit,upr=fit+1.96*se.fit)%>%
+  mutate(model = ordered(model,levels = c("Unmediated","Hgb mediated")))
+
+# hgb_plot <- ggplot(all_pred,aes(x=factor(COG_AGE),y=fit,color=oSex,ymin=lwr,ymax=upr)) +geom_point(position = position_dodge(width=.1),size=3)+
+#     geom_errorbar(size=line_size,position = position_dodge(width=.12),width=.12)+
+#     scale_color_manual(values = c("Male"=scales::muted('blue',l=60,c=80),"Female"=scales::muted('red',l=60,c=80))) + 
+#     theme(legend.title = element_blank()) +
+#     ylab("Overall Accuracy") + xlab("Age (years)")+
+#     ylim(-1.1,1)+facet_wrap(~model)
+# hgb_plot
+hgb_plot2<-ggplot(all_pred,aes(x=factor(COG_AGE),y=fit,color=oSex,ymin=lwr,ymax=upr,alpha=model)) +geom_point(position = position_dodge(width=1),size=3)+
+    geom_errorbar(size=line_size,position = position_dodge(width=1),width=.5)+
+    scale_color_manual(values = c("Male"=scales::muted('blue',l=60,c=80),"Female"=scales::muted('red',l=60,c=80))) + 
+    theme(legend.title = element_blank()) +
+    ylab("Overall Accuracy") + xlab("Age (years)")+
+    ylim(-1.1,1)+scale_alpha_discrete(range=c("Hgb mediated"=1,"Unmediated"=.5))
+hgb_plot2
+# save_plot(plot=hgb_plot,filename = "figs/cog_moderated_mediation.svg",base_width = 6)
+save_plot(plot=hgb_plot2,filename = "figs/cog_moderated_mediation2.svg",base_width = 6)
+```
+
+```{r hgb_mediation supplementary figure, echo=FALSE, tidy=TRUE,cache=TRUE,message=FALSE}
+# Getting the ACME and CIs along the age range and plotting.
+
+s = summary(mediation::mediate(fit_mediator, fit_indirect, treat='oSex', mediator='Hgb',
+                               covariates = list(COG_AGE=8),boot=T,sims = 100))#%>%filter(term=="acme_0")
+result <-data.frame(age=8,acme_value=s$d.avg,ade_value=s$z.avg,totaleff_value=s$tau.coef,
+                         acme_ci=s$d.avg.ci,ade_ci=s$z.avg.ci,totaleff_ci=s$tau.ci)%>%mutate(cis=c("low","high"))%>%
+    pivot_wider(names_from = cis,values_from=contains("ci"),names_glue="{.value}{cis}")%>%
+    pivot_longer(cols = c(ade_value,totaleff_value,ade_cihigh,ade_cilow,totaleff_cilow,totaleff_cihigh),
+                                      names_to = c("var","ci"),
+                                      names_pattern = "(.+)_(.+)")%>%pivot_wider(names_from = ci,values_from=value)
+
+for (age in seq(8.5,22,by=.5)) {
+
+  m <- mediation::mediate(fit_mediator, fit_indirect, treat='oSex', mediator='Hgb',
+  covariates = list(COG_AGE=age),boot=T,sims = 1000)#%>%filter(term=="acme_0")
+  s <- summary(m)
+  this_result <-data.frame(age=age,acme_value=s$d.avg,ade_value=s$z.avg,totaleff_value=s$tau.coef,
+                         acme_ci=s$d.avg.ci,ade_ci=s$z.avg.ci,totaleff_ci=s$tau.ci)%>%mutate(cis=c("low","high"))%>%
+    pivot_wider(names_from = cis,values_from=contains("ci"),names_glue="{.value}{cis}")%>%
+    pivot_longer(cols = c(ade_value,totaleff_value,ade_cihigh,ade_cilow,totaleff_cilow,totaleff_cihigh),
+                                      names_to = c("var","ci"),
+                                      names_pattern = "(.+)_(.+)")%>%pivot_wider(names_from = ci,values_from=value)
+    
+  result <- rbind(result, this_result)
+}
+med_result_obj <- result
+
+med_effect_age2 <- ggplot(med_result_obj%>%filter(age%in%seq(8,22,by=1)),aes(x=age,y=acme_value,ymin=acme_cilow,ymax=acme_cihigh))+geom_errorbar()+geom_point()+geom_hline(yintercept = 0) + ylab("Mediation Effect")+xlab("Age (years)")
+
+# Supplementary material
+supplementary_figure6<-med_effect_age2
+print(supplementary_figure6)
+save_plot(filename = "figs/supplementary_figure6_mediation.svg",supplementary_figure6,base_height = 6,base_width = 6)
+```
+
+#### Non-clinical associations  
+Look at only participants that do not meet clinical cutoffs for iron deficiency. This is to see whether Hgb levels are associated with cognition even when individuals do not meet thresholds for iron deficiency/anemia (including visits with Hgb>=12g/dL).  
+
+```{r indiv_cog_scores_filtered,fig.width=7,fig.height=8,echo=FALSE}
+# Hgb subclinical
+Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff)
+hgb_gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE,k=6) + sex + s(Hgb,k=4), data = Hgb,subset = Hgb>=12)
+summary(hgb_gmod)
+partialr2<-model_effects(hgb_gmod)
+cat(sprintf("Partial R2 for Hgb = %1.2f\n",partialr2))
+
+kableExtra::kbl(tidy(hgb_gmod),
+                caption = "Subclinical cognitive effects",
+                digits=c(1,1,1,1,3))%>%
+  kableExtra::kable_classic_2(full_width=FALSE, position="left")
+
+hgb_gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE,k=6) + oSex + s(Hgb,k=4) + s(Hgb,by=oSex), data = Hgb,subset = Hgb>=12)
+summary(hgb_gmod)
+
+```
+
+### Hemoglobin cognition figure:
+```{r assemble_hgb_figures,eval=TRUE, echo=FALSE}
+#Left: effect of hemoglobin
+#Right: Sex effects with Hgb adjustment
+
+hgb_cog_fig <- plot_grid(plotlist = list(hgb_cog,hgb_plot2),nrow = 2)
+hgb_cog_fig
+save_plot(filename = "figs/Hgb_cognition_2panel.svg",plot = hgb_cog_fig,base_height = 12,base_width = 6)
+
+```
+
+## Part 3: PCA analysis of iron metrics 
+
+### Fit the PCA models  
+We match all blood data by time of blood draw and perform 2 different PCAs. The first is done is a subset of the data that also includes C-reactive protein (inflammatory marker). The second uses only Hgb, Ferritin, and Transferrin. The CRP model is used as a validation of the solution from the 3-variable model. After deriving the PCs, we look at developmental effects, and then filter by time from cog visit for the cognitive analysis.  
+```{r pca,fig.height=3,fig.width=4,echo=FALSE}
+# First do the PCA with the restricted sample of subjs that also have a C-reactive protein measurement (more specificity re: infections)
+data_for_PCA_CRP <- df%>%
+  ungroup()%>%
+  select(Transferrin,Ferritin,Hgb,CRP,BBL_ID,Age,sex)%>%
+  distinct()%>%
+  na.omit() #PCA cannot have na values.
+pca_crp <- prcomp(x = data_for_PCA_CRP%>%select(Ferritin,Hgb,CRP,Transferrin),scale. = T)#Do the PCA
+# Signs are arbitrary, flip to make more interpretable
+pca_crp$rotation=pca_crp$rotation*-1
+pca_crp$x=pca_crp$x*-1
+#just some visualizations
+# fviz_eig(pca_crp)
+crp_loading <- fviz_pca_var(pca_crp,col.var = "contrib")+
+  theme_classic()+
+  theme(plot.title = element_blank(),line = element_line(color="black"),legend.position = "none")
+crp_loading
+# fviz_pca_ind(pca_crp)
+data_for_PCA_df_CRP <- cbind(data_for_PCA_CRP,as.data.frame(pca_crp$x)) #binding the results back to the dataframe.
+
+# Now PCA with the broader sample that doesn't require CRP
+data_for_PCA <- df%>%
+  ungroup()%>%
+  select(Transferrin,Ferritin,Hgb,BBL_ID,Age,Transferrin,sex)%>%
+  distinct()%>%
+  na.omit()
+pca <- prcomp(x = data_for_PCA%>%select(Ferritin,Hgb,Transferrin),scale. = T)
+# Signs are arbitrary, flip to make more interpretable
+pca$rotation=pca$rotation*-1
+pca$x=pca$x*-1
+# fviz_eig(pca)
+# fviz_pca_var(pca,col.var = "contrib")+theme(plot.title = element_blank())+theme_classic()
+pca_fig<-fviz_pca_var(pca,col.var = "contrib")+
+  theme_classic() + 
+  theme(plot.title = element_blank(),line = element_line(color="black"),legend.position = "none")
+pca_fig
+# fviz_pca_ind(pca)
+data_for_PCA_df <- cbind(data_for_PCA,as.data.frame(pca$x))
+df_pca <- data_for_PCA_df %>% left_join(df)
+df_pca_crp <- df %>% left_join(data_for_PCA_df_CRP)
+
+# Compare the PC scores between both models
+data_for_PCA_df$model="noCRP"
+data_for_PCA_df_CRP$model="CRP"
+compare_pca <- bind_rows(data_for_PCA_df,data_for_PCA_df_CRP)
+compare.long <- compare_pca%>%select(-CRP)%>%pivot_longer(cols = contains("PC"),names_to = "PCs",values_to = "loadings")%>%pivot_wider(names_from = "model",values_from = "loadings")%>%filter(PCs%in%c("PC1","PC2"))
+compare.long$PC_labels <- factor(compare.long$PCs,levels=c("PC1","PC2"),labels = c("Inflammatory\nindex (PC1)","Iron status\nindex (PC2)"))
+
+rval <- cor(compare.long$CRP[compare.long$PCs=="PC2"],compare.long$noCRP[compare.long$PCs=="PC2"],use = "pair")
+rval_inflammtaory <- cor(compare.long$CRP[compare.long$PCs=="PC1"],compare.long$noCRP[compare.long$PCs=="PC1"],use = "pair")
+ann_text <- data.frame(PC_labels=c("Inflammatory\nindex (PC1)","Iron status\nindex (PC2)"),CRP = 1,noCRP = -1,lab = c(sprintf("r = %1.2f",rval_inflammtaory),sprintf("r = %1.2f",rval)))
+
+pca_comparison <- ggplot(compare.long,aes(x=CRP,y=noCRP))+
+  geom_point(colour="white",fill="gray",pch=21)+
+  geom_smooth(method = "lm",color="black",se = FALSE)+
+  facet_grid(~PC_labels)+
+  geom_text(data=ann_text,aes(label=lab))+
+  xlab("Component score (w/ CRP)")+ylab("Component score (w/o CRP)")
+# 
+# compare_pca <- full_join(data_for_PCA_df,data_for_PCA_df_CRP,by=c("BBL_ID","Age"),suffix = c("_noCRP","_CRP"))
+# rval = cor(compare_pca$PC2_CRP,compare_pca$PC2_noCRP,use = "pairwise.complete.obs")
+# rval_inflammtaory = cor(compare_pca$PC1_CRP,compare_pca$PC1_noCRP,use = "pairwise.complete.obs")
+# text_labels = c(PC1=sprintf("r = %1.2f",rval_inflammtaory),PC2=sprintf("r = %1.2f",rval))
+# cat(sprintf("PC1 r = %1.2f\nPC2 r = %1.2f",rval_inflammtaory,rval))
+# pca_comparison <- ggplot(compare_pca,aes(x=PC2_noCRP,y=PC2_CRP))+
+#   geom_point() + 
+#   xlab("PC2 (w/ CRP)")+ylab("PC2 (w/o CRP)")+
+#   annotate("text",label=text_label,x=-1,y=1)
+pca_comparison
+
+df_pca$oSex = ordered(df_pca$sex,levels=c(1,2),labels=c("Male","Female"))
+
+# Supplementary material
+supplementary_figure8 <- pca_fig + crp_loading + pca_comparison
+save_plot(filename = "figs/supplementary_figure8_pca.svg",supplementary_figure8,base_height = 5,base_width = 13)
+
+```
+
+### Look at how the iron status index changes with development.
+Now that we have created iron status index, let's next look how it changes with age. We see the same sort of age*sex interaction we saw when looking at the individual measures above.  
+
+```{r pca_development, echo=FALSE,message=FALSE, echo=FALSE}
+# now do some plotting
+# Development plot
+df_pca$BBLFac = as.factor(df_pca$BBL_ID)
+gmod <- gamm4::gamm4(PC2 ~ s(Age) + oSex + s(Age,by=oSex),data = df_pca,
+                     random = ~(Age|BBL_ID),REML = TRUE)
+gmod2 <- bam(PC2 ~ s(Age) + oSex + s(Age,by=oSex)+s(Age,BBLFac,bs="re"),data = df_pca,method = "REML") #refit with bam sto used linked smooths for a more accurate partial R2.
+gmod_reduced2 <- bam(PC2 ~ s(Age,sp=gmod2$sp[1]) + oSex+s(Age,BBLFac,bs="re"),data = df_pca,method="REML")
+
+cat(sprintf("Partial R2 = %1.2f",partialR2(gmod2,gmod_reduced2)))
+summary(gmod$gam)
+
+pc2_dev<-visualize_model(modobj = gmod,smooth_var = "Age",int_var = "oSex",group_var = "BBL_ID",
+                   derivative_plot = FALSE,show.data = TRUE,side_density = FALSE,
+                   xlabel = "Age (years)",ylabel = "Iron status index")
+
+print(pc2_dev)
+save_plot(plot = pc2_dev,filename = 'figs/PC2_development.svg',base_width = 4.5)
+
+#SES
+gmodses <- gamm4::gamm4(PC2 ~ s(Age) + oSex + s(Age,by=oSex)+ s(envSES),
+             data = df_pca,REML = TRUE,random = ~(Age|BBL_ID))
+gmodses_reduced <- gamm4::gamm4(PC2 ~ s(Age) + oSex + s(Age,by=oSex),
+             data = df_pca,REML = TRUE,random = ~(Age|BBL_ID))
+
+summary(gmodses$gam)
+cat(sprintf("Partial R2 = %1.3f",partialR2(full_mod = gmodses$gam,reduced_mod = gmodses_reduced$gam)))
+
+# Plot using the average of the repeated measures for clarity.
+newdata <- gmodses$gam$model%>%group_by(BBL_ID)%>%
+  summarise(Age = mean(gmodses$gam$model$Age),oSex=gmodses$gam$model$oSex[1],envSES=mean(envSES),PC2=mean(PC2))
+fitted <- fitted_values(object = gmodses$gam,data = newdata)
+pc2_ses<-ggplot(fitted,aes(x=envSES,y=PC2))+
+  geom_point(alpha = .35,stroke = 0,size=2)+
+  geom_line(aes(y=fitted),size=1.5)+
+  geom_ribbon(aes(y=fitted,ymin=lower,ymax=upper),alpha = .3, linetype = 0)+
+  xlab("Neighborhood SES") + ylab("Iron status index")
+# pc2_ses<-visualize_model(modobj = gmodses,smooth_var = "envSES",group_var = "BBL_ID",
+#                    derivative_plot = FALSE,show.data = TRUE,side_density = FALSE,
+#                    xlabel = "Neighborhood SES",ylabel = "Iron status index")
+print(pc2_ses)
+#match PC scores to proximal cognitive assessments
+difference_cutoff = .5 #years
+match_df <- match_PCA_and_cog(df_pca,"PC2",difference_cutoff,abs_diff = FALSE)
+match_df <- match_df %>%
+  mutate(sex=factor(sex,levels = c(1,2),labels = c("Male","Female")),oSex = ordered(sex))%>%#just changing variable types.
+  left_join(ses,by=c("BBL_ID"="bblid"))
+
+# Supplementary material
+# dage <- draw(gmod,residuals=TRUE)+plot_layout(nrow = 1,ncol=2)&theme(plot.title = element_blank())
+# dses <- draw(gmodses,residuals=TRUE)+plot_layout(nrow = 1,ncol=3)&theme(plot.title = element_blank())
+# supplementary_figure9 <- dage / dses + plot_layout(nrow=2,ncol=1)
+# save_plot(filename = "figs/supplementary_figure8_pca.svg",supplementary_figure8,base_height = 5,base_width = 10)
+```
+
+#### PC scores and cogntive variables
+Now fit cognitive models using the principle component score. The second principle component, which reflects iron status, is robustly associated with the accuracy factor scores from the CNB.  
+
+```{r updated_pca_models,fig.width=6}
+# Accuracy
+gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE) + sex + s(PC2), data = match_df,method = "REML")
+summary(gmod)
+cat(sprintf("Partial R2 = %1.3f",model_effects(gmod)))
+dcog <-draw(gmod)+plot_layout(ncol=2)&theme(plot.title = element_blank())
+# gratia::draw(gmod,residuals = TRUE)
+pc2_eff <- visualize_model(gmod,smooth_var = "PC2",show.data = TRUE,side_density = FALSE,
+                           xlabel = "Iron status index",ylabel=expression(paste("Overall Accuracy (",italic("z"),")")))
+
+## Specificity check using PC1
+match_df_PC1 <- match_PCA_and_cog(df_pca,"PC1",difference_cutoff,abs_diff = FALSE)
+match_df_PC1 <- match_df_PC1 %>%
+  mutate(sex=factor(sex,levels = c(1,2),labels = c("Male","Female")),oSex = ordered(sex))%>%#just changing variable types.
+  left_join(ses,by=c("BBL_ID"="bblid"))
+gmod_PC1 <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE) + s(PC1,k=4), data = match_df_PC1,method = "REML")
+summary(gmod_PC1)
+cat(sprintf("Partial R2 = %1.3f",model_effects(gmod_PC1)))
+pc1_eff <- visualize_model(gmod_PC1,smooth_var = "PC1",show.data = TRUE,side_density = FALSE,
+                           xlabel = "Inflammatory index",ylabel = expression(paste("Overall Accuracy (",italic("z"),")")))
+
+pc2_eff / pc1_eff
+
+
+```
+
+#### Cognitive summary
+Summarizing effects across individual cogntive subdomains.   
+
+```{r indiv_cog_scores,fig.width=5,fig.height=4, echo=FALSE}
+indiv_df <- match_df%>%
+  mutate(across(.cols = where(is.numeric),.fns = function(x){scale(x)%>%as.vector}))%>%
+  pivot_longer(cols = starts_with("NAR")&contains("Accuracy")&!contains("Overall"),names_to = "cog_measure",values_to = "z_score")
+
+model_df <- indiv_df %>%
+  group_by(cog_measure)%>%
+  do(fit_cog = tidy(gam(z_score ~ s(COG_AGE) + s(PC2)+ sex, data = .,method = "REML"))) %>% 
+  unnest(fit_cog)
+PC2_results <- model_df %>%
+  filter(term == 's(PC2)')%>%
+  mutate(fdr.p = p.adjust(p.value,method = "fdr"))
+
+result_df <- indiv_df %>%
+  group_by(cog_measure)%>%
+  do(partialr2 = model_effects(gam(z_score ~ s(COG_AGE) + sex + s(PC2), data = .,method = "REML")))%>%
+  unnest(partialr2)%>%
+  left_join(PC2_results)%>%
+  mutate(Metric = factor(cog_measure,
+                         levels = c("NAR_F1_Exec_Comp_Cog_Accuracy",
+                                    "NAR_F2_Social_Cog_Accuracy",
+                                    "NAR_F3_Memory_Accuracy"),
+                         labels = c("Executive","Social","Memory")))
+
+formatted_table <- format_regression_table(result_df,caption = "eTable 7. Association between the iron status index (PC2) and cognitive subdomains.")
+formatted_table
+formatted_table %>% save_kable("figs/pc2_cognition_results.png",zoom=3)
+```
+
+
+#### Interaction with sex
+Does the association depend on sex, or is it true across sexes?  
+(It does not).    
+
+```{r indiv_cog_scores_male,fig.width=3,fig.height=4}
+gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE) +PC2*oSex, data = match_df)
+summary(gmod)
+# Effect does not differ by sex.
+```
+
+#### Make the figure
+```{r pc2_figure, echo=FALSE,fig.height=10}
+# Generating a figure that combines the relevant PCA analysis plots.
+pc2_top <- plot_grid(plotlist = list(crp_loading+theme(plot.title = element_blank()),pc2_dev),nrow = 1,rel_widths = c(1,1))
+pc2_bottom <- plot_grid(plotlist = list(pc2_ses,pc2_eff),nrow = 1,rel_widths = c(1,1))
+pc_fig <- plot_grid(plotlist = list(pc2_top,pc2_bottom),nrow = 2)
+pc_fig
+save_plot(filename = "figs/PC2_figure.svg",pc_fig,base_height = 8,base_width = 8.5)
+
+# Supplementary material
+
+# supplementary_figure9 <- dage / dses / dcog + plot_layout(nrow=3)
+# save_plot(filename = "figs/supplementary_figure9_pca.svg",supplementary_figure9,base_height = 5,base_width = 10)
+layout <- "
+AABB
+AABB
+CCCC
+CCCC
+DDEE
+DDEE"
+# 
+# BBCC
+# ####
+# DDEE
+# DDEE
+# DDEE"
+supplementary_figure = pca_fig+crp_loading+pca_comparison+pc1_eff +pc2_eff+ plot_layout(design = layout)
+supplementary_figure
+save_plot(filename = "figs/supplementary_figure9_pca.svg",supplementary_figure,base_height = 9,base_width = 8)
+
+```
+
+
+## Part 4: Effects on the brain. 
+### Hemoglobin and fractional anisotropy.
+We really only have enough data to look at hemoglobin in relation to the brain scans after matching up scans to blood tests that occurred within 6 months. Below, we can see the effect of hemoglobin on fractional anisotropy from each tract from the JHU atlas. Hgb is significantly associated with SLF and uncinate anisotropy.  
+
+```{r brain_data_wrangling, echo=FALSE,message=FALSE}
+Hgb <- match_scan_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff,abs_diff = FALSE)
+Hgb$oSex <-ordered(Hgb$sex,levels = c(1,2), labels = c("Male","Female"))
+Hgb <- Hgb %>% rowwise()%>%mutate(
+  dti_fa_slf = mean(dti_dtitk_jhutract_fa_slf_l,dti_dtitk_jhutract_fa_slf_r,na.rm = T),
+  dti_fa_uf = mean(dti_dtitk_jhutract_fa_uf_l,dti_dtitk_jhutract_fa_uf_r,na.rm = T),
+  dti_fa_atr = mean(dti_dtitk_jhutract_fa_atr_l,dti_dtitk_jhutract_fa_atr_r,na.rm = T),
+  dti_fa_cst = mean(dti_dtitk_jhutract_fa_cst_l,dti_dtitk_jhutract_fa_cst_r,na.rm = T),
+  dti_fa_cgc = mean(dti_dtitk_jhutract_fa_cgc_l,dti_dtitk_jhutract_fa_cgc_r,na.rm = T),
+  dti_fa_cgh = mean(dti_dtitk_jhutract_fa_cgh_l,dti_dtitk_jhutract_fa_cgh_r,na.rm = T),
+  dti_fa_ifo = mean(dti_dtitk_jhutract_fa_ifo_l,dti_dtitk_jhutract_fa_ifo_r,na.rm = T),
+  dti_fa_ilf = mean(dti_dtitk_jhutract_fa_ilf_l,dti_dtitk_jhutract_fa_ilf_r,na.rm = T))
+
+#### Demographic table ####
+Hgb %>% filter(!is.na(dti_fa_uf)&!is.na(Hgb)&!is.na(SCAN_AGE))%>%
+  ungroup()%>% summarise(min_age = min(SCAN_AGE),
+                  max_age=max(SCAN_AGE),
+                  mean_age=mean(SCAN_AGE),
+                  sd_age=sd(SCAN_AGE),
+                  n=sum(!is.na(Hgb)),
+                  nmale=sum(!is.na(Hgb)&oSex=="Male"),
+                  nfemale=sum(!is.na(Hgb)&oSex=="Female"),
+                  malefemale = sprintf("%d/%d",nmale,nfemale),
+                  agerange = sprintf("%1.2f-%1.2f",min_age,max_age),
+                  msd = sprintf("%1.2f (%1.2f)",mean_age,sd_age))%>%
+  select(n,malefemale,agerange,msd)%>%
+  kableExtra::kbl(caption = "<b>Demographics table for white matter FA models</b>",
+                  col.names = c("<i>N</i>", "Male/Female","Age range","Mean (<i>SD</i>)"),
+                  align = "l",escape = F)%>%
+  kableExtra::kable_classic(full_width=F,position="left")
+
+```
+
+
+```{r brain_models,warning=FALSE,fig.width=10,echo=FALSE}
+
+slfmod <- gam(dti_fa_slf ~ sex + s(SCAN_AGE,k=4) + s(Hgb,k=4) , data = Hgb,method = "REML")
+summary(slfmod)
+p_slf <- visualize_model(modobj = slfmod,smooth_var = "Hgb",show.data = TRUE,side_density = FALSE,
+                     xlabel = "Hemoglobin (g/dL)",ylabel = "Fractional anisotropy",plabels = "SLF")
+save_plot(filename = "figs/Hgb_slf.svg",plot = p_slf,base_width = 4)
+
+ufmod <- gam(dti_fa_uf ~ sex + s(SCAN_AGE,k=4) + s(Hgb,k=4) , data = Hgb)
+ufmod_reduced <- gam(dti_fa_uf ~ sex + s(SCAN_AGE,k=4,sp=ufmod$sp[1]) , data = Hgb)
+summary(ufmod)
+p_uf <- visualize_model(modobj = ufmod,smooth_var = "Hgb",show.data = TRUE,side_density = FALSE,
+                     xlabel = "Hemoglobin (g/dL)",ylabel = "Fractional anisotropy",plabels = "UF")
+save_plot(filename = "figs/Hgb_uncinate.svg",plot=p_uf,base_width = 4)
+p_uf <-p_uf + theme(axis.title.y = element_blank())
+
+Hgb_long <- Hgb %>% pivot_longer(cols = starts_with("dti_fa"),names_to="Tract")
+model_df <- Hgb_long %>%
+  group_by(Tract)%>%
+  do(fit_tract = tidy(gam(value ~ s(SCAN_AGE,k=4) + sex + s(Hgb,k=4), data = .,method = "REML"))) %>%
+  unnest(fit_tract)
+Hgbresults <- model_df %>%
+  filter(term == 's(Hgb)')%>%
+  mutate(fdr.p = p.adjust(p.value,method = "fdr"))%>%
+  mutate(Tract_label = toupper(str_remove(Tract,pattern = "dti_fa_")))
+result_df <- Hgb_long %>%
+  group_by(Tract)%>%
+  do(partialr2 = model_effects(gam(value ~ sex + s(SCAN_AGE,k=4) + s(Hgb,k=4), data = .,method = "REML")))%>%
+  unnest(partialr2)%>%
+  left_join(Hgbresults)%>%
+  mutate(Metric =Tract_label)
+
+formatted_table <- format_regression_table(result_df,caption = "<b>eTable 8. Association between hemoglobin and white matter fractional anisotropy.</b>")
+formatted_table<- formatted_table%>%
+  footnote(general_title = "Tracts",
+           general = c("ATR: Anterior thalamic radiation",
+                       "CGC: Cingulum (cingulate gyrus)",
+                       "CGH: Cingulum (hippocampus)",
+                       "CST: Cerebrospinal tract",
+                       "IFO: Inferior fronto-occipital fasciculus",
+                       "ILF: Inferior longitudinal fasciculus",
+                       "SLF: Superior longitudinal fasciculus",
+                       "UF: Uncinate fasciculus"))
+formatted_table
+save_kable(formatted_table,"figs/Hgb_FA_regression_table.png",zoom = 3)
+
+
+hgb_fa_fig_top <- plot_grid(plotlist = list(p_slf,p_uf),nrow=1)
+hgb_fa_fig_top
+save_plot(filename = "figs/Hgb_FA_fig_top.svg",hgb_fa_fig_top,base_height = 4,base_width = 7)
+
+# Supplementary material
+dslf <- draw(slfmod,residuals = T,unconditional = T)&theme(plot.title = element_blank())
+duf <- draw(ufmod,residuals = T,unconditional = T)&theme(plot.title = element_blank())
+supplementary_figure10 <- dslf/duf + plot_layout(nrow=2)
+save_plot(filename = "figs/supplementary_figure10_pca.svg",supplementary_figure10,base_height = 12,base_width = 12)
+```
+
