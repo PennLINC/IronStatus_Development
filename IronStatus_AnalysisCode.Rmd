@@ -1,5 +1,5 @@
 ---
-title: "Development of iron status during youth"
+title: "Development of iron status in the PNC and associations with cognitive performance and white matter integrity."
 author: "Bart Larsen"
 date: "5/09/2022"
 output:
@@ -239,14 +239,15 @@ return(Formatted_table)
 
 ```
 
-# Development of iron status in the PNC and associations with cognitive performance and white matter integrity.
+# Sample description and analysis results.  
+Below is the output of the data organization, sample curation, and analysis code for this project. To see the step-by-step instructions and the code itself, please view the rmarkdown file, `IronStatus_AnalysisCode.Rmd` [in the repository](https://github.com/PennLINC/IronStatus_Development).  
 
 ```{r load_data,include=FALSE,cache=FALSE}
 #### Loading the input dataframe ####
-df <- readRDS(file= "Files/input_dataframe.rds")
+df <- readRDS(file= "input_files/input_dataframe.rds")
 
 #### Loading SES ####
-ses <- fread('Files/n9498_go1_environment_factor_scores_tymoore_20150909.csv')%>%
+ses <- fread('input_files/n9498_go1_environment_factor_scores_tymoore_20150909.csv')%>%
   mutate(bblid=as.character(bblid))
 
 df <- df %>%
