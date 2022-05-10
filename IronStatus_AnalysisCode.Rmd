@@ -243,10 +243,10 @@ return(Formatted_table)
 
 ```{r load_data,include=FALSE,cache=FALSE}
 #### Loading the input dataframe ####
-df <- readRDS(file= "Files/input_dataframe.rds")
+df <- readRDS(file= "input_files/input_dataframe.rds")
 
 #### Loading SES ####
-ses <- fread('Files/n9498_go1_environment_factor_scores_tymoore_20150909.csv')%>%
+ses <- fread('input_files/n9498_go1_environment_factor_scores_tymoore_20150909.csv')%>%
   mutate(bblid=as.character(bblid))
 
 df <- df %>%
