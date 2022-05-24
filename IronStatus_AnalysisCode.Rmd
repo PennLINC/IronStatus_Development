@@ -22,7 +22,7 @@ library(broom)
 library(cowplot)
 library(patchwork)
 library(viridis)
-theme_set(theme_classic(base_size = 20))
+theme_set(theme_classic(base_size = 18))
 knitr::knit_hooks$set(inline = function(x) {
   if(!is.numeric(x)){
     x
@@ -33,7 +33,7 @@ knitr::knit_hooks$set(inline = function(x) {
 options(scipen=8)
 source('~/Box Sync/Work/BBL/Code/Tools/GAMM_plotting.R')
 source('~/Box Sync/Work/BBL/Code/Tools/GAM_Effects.R')
-knitr::opts_chunk$set(fig.height = 6,fig.width = 6,warning = FALSE,fig.path="figures/",fig.retina = 1,dpi=300)
+knitr::opts_chunk$set(echo=FALSE, fig.height = 6,fig.width = 6,warning = FALSE,message=FALSE,fig.path="figures/",fig.retina = 1,dpi=300)
 ```
 
 ```{r functions,include=FALSE}
@@ -233,7 +233,7 @@ Formatted_table <- result_table %>%
                       align="lcccc",escape = F,
                       digits = c(0,2,1,2,3,1))%>%
   footnote(general = "<i>abbr</i>. <i>edf</i>: Effective degrees of freedom; FDR: False discovery rate.",escape = F)%>%
-  kableExtra::kable_classic(full_width=F,position="left",font_size=12,html_font="arial")
+  kableExtra::kable_classic(full_width=F,font_size=12,html_font="arial")
 return(Formatted_table)
 }
 
@@ -386,7 +386,7 @@ This sample was drawn from the  Philadelphia Neurodevelopmental Cohort (PNC). As
 
 Fitting GAMMs to model the age and sex effects for Hgb, ferritin, and transferrin.  
 
-```{r dev_plots,fig.width=12, fig.height=5,warning=FALSE,echo=FALSE,message=FALSE,cache=TRUE}
+```{r dev_plots,fig.width=15, fig.height=5,warning=FALSE,echo=FALSE,message=FALSE,cache=TRUE}
 # GAMMs
 # Hgb
 hgb_mod <- gamm4::gamm4(Hgb ~ s(Age,k=5, fx = F) + oSex + s(Age,by=oSex,k=5, fx = F),
@@ -442,29 +442,13 @@ save_plot('figs/cTransferrin_development.svg',plot = pt)
 pgrid_dev <- plot_grid(plotlist = list(ph,pf,pt),nrow = 1)
 pgrid_dev
 save_plot(filename = "figs/developmental_plots.svg",pgrid_dev,base_height = 5,base_width = 15)
-
+  
 ## Regression table
 regression_table <- rbind(
     tidy(hgb_mod$gam),
     tidy(ferr_mod$gam),
     tidy(Trans_mod$gam))%>%
   select(-ref.df)
-Formatted_regression_table <- regression_table%>%
-  mutate(p2 = case_when(p.value <.001 ~ "< .001",
-                            p.value>.001 ~ str_remove(as.character(round(p.value,digits = 3)),"0+")))%>%
-  select(-p.value)%>%
-  kbl(caption = "<b>Regression table for developmental models.</b>",
-      digits = c(1,1,1,3),
-      col.names = c("Term","<i>edf</i>","<i>F</i>","<i>P</i>"),
-      align = "lccc",
-      escape = F)%>%
-  pack_rows("Hgb",1,2,)%>%pack_rows("Ferritin",3,4)%>%pack_rows("Transferrin",5,6)%>%
-  footnote(general = c("<code>s(Age)</code>: Smooth effect of Age in males.",
-                       "<code>s(Age):oSexFemale </code>: Smooth deviation from males for females."),
-           escape = F)%>%
-  kable_classic(full_width=F,position="left",html_font = "arial",font_size=12)
-Formatted_regression_table
-  
 ## multiple comparisons
 result_table <- regression_table%>%
   filter(str_detect(term,":"))%>%
@@ -477,7 +461,6 @@ Formatted_table
   
 ## Supplementary material
 Formatted_table %>% kableExtra::save_kable(file = "figs/development_table_mc.png",zoom=3)
-Formatted_regression_table %>% kableExtra::save_kable(file = "figs/development_table.png",zoom=3)
 ```
 
 ### Puberty effects in females
@@ -485,20 +468,24 @@ We saw a divergence in the developmental effects around the onset of adolescence
 
 If our hypothesis is correct, we should see nonlinear effects such that the slope of Hgb by age differs pre and post menarche.  In the regression models below, `age_menarche_centered` is age in years recentered on the self-reported age of menarche in female participants.    
 
-```{r puberty, fig.height=3.5,fig.width=10,warning=FALSE, echo=FALSE}
+```{r puberty_data, fig.height=3.5,fig.width=10,warning=FALSE, echo=FALSE}
 # data organization
 df_puberty <- df %>%
   filter(!(tanner_girl_3==2&Age>COG_AGE_timepoint1))%>% #we can't use data where they may have entered menarche subsequent to tanner assessment (for blood measures that occur after the cognitive/tanner visit).
   mutate(age_menarche_centered = Age - menarche_age,
          oSex = ordered(sex,levels=c(1,2),labels = c("Male","Female"))) #Just organizing the variables for the models.
 
-df_puberty %>% group_by(BBL_ID)%>%
+puberty_inclusions <- df_puberty %>% group_by(BBL_ID)%>%
   filter(age_menarche_centered>-10&age_menarche_centered<=10)%>% #there is very sparse coverage outside this range.
   summarise(n=sum(!is.na(Hgb)&!is.na(age_menarche_centered)))%>%
-  summarise(num_participants = sum(n>0),num_visits=sum(n))%>%
-  kableExtra::kbl(caption = "Obervations for menarche analyses")%>%kable_classic(full_width=F)
+  summarise(num_participants = sum(n>0),num_visits=sum(n))
+
+```
+Number of participants included: `r puberty_inclusions$num_participants[1]`  
+Number of observations included: `r puberty_inclusions$num_visits[1]`  
 
 
+```{r puberty_analyses, fig.height=3.5,fig.width=10,warning=FALSE, echo=FALSE}
 # Modeling
 ## age relative to menarche
 ### Hgb
@@ -751,8 +738,7 @@ hgb_ses_plot <- ggplot(all_pred,aes(x=Age,y=fit,color=model,fill=model,linetype=
   ylab("Hgb") + xlab("Age (years)")
 save_plot("Figs/SES_sex_Hgb.svg",plot = hgb_ses_plot)
 print(hgb_ses_plot)
-print(result_table)
-
+result_table
 
 ```
 
@@ -802,13 +788,13 @@ by_metric%>%bind_rows(totals)%>%
   kableExtra::kbl(caption = "<b>Demographics table for cognitive models</b>",
                   col.names = c("Metric","<i>N</i>", "Male/Female","Age range","Mean (<i>SD</i>)"),
                   align = "l",escape = F)%>%
-  kableExtra::kable_classic(full_width=F,position="left")
+  kableExtra::kable_classic(full_width=T,position="left")
 
 ```
  Participants who had at least one iron status metric within six months prior to participation in the PNC were also included in cognitive ($n$ = `r totals$n`; male/female = `r totals$malefemale`; ages `r totals$agerange`y, $M (SD)$ = `r totals$msd`).  
  
 #### Hemoglobin
-```{r indiv_blood_cog_measures,warning=FALSE,fig.height=6,eval=TRUE,echo=FALSE, message=FALSE}
+```{r indiv_blood_cog_measures,warning=FALSE,fig.height=4,eval=TRUE,echo=FALSE, message=FALSE}
 time_diff = .5 #(.5 years)
 ## Hgb
 Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff)
@@ -816,7 +802,7 @@ Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_di
 ### Overall accuracy
 gmod <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE) +  s(Hgb,k=4), data = Hgb,method = "REML")
 gmod_reduced <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE, sp = gmod$sp[1]), data = Hgb ,method = "REML")
-partialR2(gmod,gmod_reduced)
+r2 <- partialR2(gmod,gmod_reduced)
 dhgb <- draw(gmod,residuals=TRUE)+plot_layout(nrow = 1,ncol=2)&theme(plot.title = element_blank())
 hcog<-gmod
 summary(gmod)
@@ -853,7 +839,7 @@ write.csv(x=result_df,file = "figs/hgb_cognition_results.csv",row.names = F)
 ```
 
 #### Ferritin
-```{r ferritin_cog,warning=FALSE,fig.height=6,eval=TRUE,echo=FALSE, message=FALSE}
+```{r ferritin_cog,warning=FALSE,fig.height=4,eval=TRUE,echo=FALSE, message=FALSE}
 ## Ferritin
 gmod <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE,fx = F)+ s(Ferritin,k=4, fx = F), data = ferritin)
 summary(gmod)
@@ -888,7 +874,7 @@ formatted_table %>% save_kable("figs/ferritin_cognition_results.png",zoom=3)
 ```
 
 #### Transferrin
-```{r transferrin_cog,warning=FALSE,fig.height=6,eval=TRUE,echo=FALSE, message=FALSE}
+```{r transferrin_cog,warning=FALSE,fig.height=4,eval=TRUE,echo=FALSE, message=FALSE}
 ## Transferrin 
 gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE, fx = F)+sex + s(Transferrin, k=4, fx = F) , data = transferrin)
 summary(gmod)
@@ -949,7 +935,7 @@ This is to see if hgb is dimensionally associated with cog irrespective of sex.
 First, test for an age-by-sex interaction.  
 Then, test males and females separately.  
 
-```{r indiv_blood_cog_measures_threshold_sex,warning=FALSE,fig.height=4,fig.width=4,echo=FALSE,message=FALSE}
+```{r indiv_blood_cog_measures_threshold_sex,warning=FALSE,echo=FALSE,message=FALSE}
 time_diff = .5
 Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff)
 
@@ -975,7 +961,7 @@ rbind(tidy(hgb_gmod)%>%left_join(maleR2),tidy(hgb_gmod_female)%>%left_join(femal
   relocate(partialr2,.after = statistic)%>%
   kableExtra::kbl(caption = "Hgb and cognition separated by sex.",digits = c(1,1,1,1,3,3))%>%
   pack_rows("Males",1,2,)%>%pack_rows("Females",3,4)%>%
-  kableExtra::kable_classic(html_font = "Arial",font_size=12,full_width=FALSE)
+  kableExtra::kable_classic(html_font = "Arial",font_size=12,full_width=TRUE)
 ```
 
 #### Mediation analysis
@@ -983,7 +969,7 @@ This is looking at sex differences in cognition with and without accounting for 
 
 There is a significant age-by-sex interaction for overall cognitive performance that essentially disappears when controlling for hemoglobin. This suggests a mediation effect.    
 
-```{r hgb_mediation part 1,fig.height=4,fig.width=4,eval=TRUE,warning=FALSE,echo=FALSE}
+```{r hgb_mediation part 1,eval=TRUE,warning=FALSE,echo=FALSE}
 nohgb_gmod <- gam(NAR_Overall_Accuracy ~s(COG_AGE)+oSex+s(COG_AGE,by=oSex), data = Hgb) #just plain sex effects controlling for age.
 # nohgb_gmod <- gam(NAR_Overall_Accuracy ~s(COG_AGE,k=4)+oSex, data = Hgb) #just plain sex effects controlling for age.
 summary(nohgb_gmod)
@@ -1139,7 +1125,7 @@ summary(hgb_gmod)
 
 ```
 
-### Hemoglobin cognition figure:
+### Figure 3 panels:
 ```{r assemble_hgb_figures,eval=TRUE, echo=FALSE}
 #Left: effect of hemoglobin
 #Right: Sex effects with Hgb adjustment
@@ -1154,7 +1140,7 @@ save_plot(filename = "figs/Hgb_cognition_2panel.svg",plot = hgb_cog_fig,base_hei
 
 ### Fit the PCA models  
 We match all blood data by time of blood draw and perform 2 different PCAs. The first is done is a subset of the data that also includes C-reactive protein (inflammatory marker). The second uses only Hgb, Ferritin, and Transferrin. The CRP model is used as a validation of the solution from the 3-variable model. After deriving the PCs, we look at developmental effects, and then filter by time from cog visit for the cognitive analysis.  
-```{r pca,fig.height=3,fig.width=4,echo=FALSE}
+```{r pca,fig.height=3,fig.width=4,echo=FALSE,message=FALSE}
 # First do the PCA with the restricted sample of subjs that also have a C-reactive protein measurement (more specificity re: infections)
 data_for_PCA_CRP <- df%>%
   ungroup()%>%
@@ -1293,7 +1279,7 @@ match_df <- match_df %>%
 #### PC scores and cogntive variables
 Now fit cognitive models using the principle component score. The second principle component, which reflects iron status, is robustly associated with the accuracy factor scores from the CNB.  
 
-```{r updated_pca_models,fig.width=6}
+```{r updated_pca_models,fig.width=6, echo=FALSE}
 # Accuracy
 gmod <- gam(NAR_Overall_Accuracy ~ s(COG_AGE) + sex + s(PC2), data = match_df,method = "REML")
 summary(gmod)
@@ -1322,7 +1308,7 @@ pc2_eff / pc1_eff
 #### Cognitive summary
 Summarizing effects across individual cogntive subdomains.   
 
-```{r indiv_cog_scores,fig.width=5,fig.height=4, echo=FALSE}
+```{r indiv_cog_scores,fig.width=5,fig.height=4, echo=FALSE,message=FALSE}
 indiv_df <- match_df%>%
   mutate(across(.cols = where(is.numeric),.fns = function(x){scale(x)%>%as.vector}))%>%
   pivot_longer(cols = starts_with("NAR")&contains("Accuracy")&!contains("Overall"),names_to = "cog_measure",values_to = "z_score")
@@ -1362,8 +1348,8 @@ summary(gmod)
 # Effect does not differ by sex.
 ```
 
-#### Make the figure
-```{r pc2_figure, echo=FALSE,fig.height=10}
+#### Figure 4
+```{r pc2_figure, echo=FALSE,fig.height=8}
 # Generating a figure that combines the relevant PCA analysis plots.
 pc2_top <- plot_grid(plotlist = list(crp_loading+theme(plot.title = element_blank()),pc2_dev),nrow = 1,rel_widths = c(1,1))
 pc2_bottom <- plot_grid(plotlist = list(pc2_ses,pc2_eff),nrow = 1,rel_widths = c(1,1))
@@ -1382,12 +1368,11 @@ CCCC
 CCCC
 DDEE
 DDEE"
-# 
-# BBCC
-# ####
-# DDEE
-# DDEE
-# DDEE"
+
+```
+
+#### eFigure 3
+```{r pc2_supplement, fig.height=12,fig.width=8}
 supplementary_figure = pca_fig+crp_loading+pca_comparison+pc1_eff +pc2_eff+ plot_layout(design = layout)
 supplementary_figure
 save_plot(filename = "figs/supplementary_figure9_pca.svg",supplementary_figure,base_height = 9,base_width = 8)
@@ -1465,6 +1450,11 @@ result_df <- Hgb_long %>%
   left_join(Hgbresults)%>%
   mutate(Metric =Tract_label)
 
+
+hgb_fa_fig_top <- plot_grid(plotlist = list(p_slf,p_uf),nrow=1)
+hgb_fa_fig_top
+save_plot(filename = "figs/Hgb_FA_fig_top.svg",hgb_fa_fig_top,base_height = 4,base_width = 7)
+
 formatted_table <- format_regression_table(result_df,caption = "<b>eTable 8. Association between hemoglobin and white matter fractional anisotropy.</b>")
 formatted_table<- formatted_table%>%
   footnote(general_title = "Tracts",
@@ -1479,15 +1469,10 @@ formatted_table<- formatted_table%>%
 formatted_table
 save_kable(formatted_table,"figs/Hgb_FA_regression_table.png",zoom = 3)
 
-
-hgb_fa_fig_top <- plot_grid(plotlist = list(p_slf,p_uf),nrow=1)
-hgb_fa_fig_top
-save_plot(filename = "figs/Hgb_FA_fig_top.svg",hgb_fa_fig_top,base_height = 4,base_width = 7)
-
-# Supplementary material
-dslf <- draw(slfmod,residuals = T,unconditional = T)&theme(plot.title = element_blank())
-duf <- draw(ufmod,residuals = T,unconditional = T)&theme(plot.title = element_blank())
-supplementary_figure10 <- dslf/duf + plot_layout(nrow=2)
-save_plot(filename = "figs/supplementary_figure10_pca.svg",supplementary_figure10,base_height = 12,base_width = 12)
+# # Supplementary material
+# dslf <- draw(slfmod,residuals = T,unconditional = T)&theme(plot.title = element_blank())
+# duf <- draw(ufmod,residuals = T,unconditional = T)&theme(plot.title = element_blank())
+# supplementary_figure10 <- dslf/duf + plot_layout(nrow=2)
+# save_plot(filename = "figs/supplementary_figure10_pca.svg",supplementary_figure10,base_height = 12,base_width = 12)
 ```
 
