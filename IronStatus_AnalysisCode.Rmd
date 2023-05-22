@@ -31,8 +31,8 @@ knitr::knit_hooks$set(inline = function(x) {
       } 
   })
 options(scipen=8)
-source('~/Box Sync/Work/BBL/Code/Tools/GAMM_plotting.R')
-source('~/Box Sync/Work/BBL/Code/Tools/GAM_Effects.R')
+source('Tools/GAMM_plotting.R')
+source('Tools/GAM_Effects.R')
 knitr::opts_chunk$set(echo=FALSE, fig.height = 6,fig.width = 6,warning = FALSE,message=FALSE,fig.path="figures/",fig.retina = 1,dpi=300)
 ```
 
@@ -845,6 +845,57 @@ formatted_table %>% save_kable("figs/hgb_cognition_results.png",zoom=3)
 write.csv(x=result_df,file = "figs/hgb_cognition_results.csv",row.names = F)
 ```
 
+##### Reviewer response: Comparing timing thresholds.
+```{r,results='asis'}
+Hgb3mo <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = 3/12)
+Hgb6mo <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = 6/12)
+Hgb1yr <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = 12/12)
+Hgb3mo$timediff="3 month"
+Hgb6mo$timediff="6 month"
+Hgb1yr$timediff="1 year"
+Hgb.compare <- rbind(Hgb3mo,Hgb6mo,Hgb1yr)
+Hgbcompare <- function(df){
+  df
+  timediff.label=df$timediff[1]
+  gmod <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE) +  s(Hgb,k=4), data = df,method = "REML")
+  gmod_reduced <- gam(NAR_Overall_Accuracy ~ sex + s(COG_AGE, sp = gmod$sp[1]), data = df ,method = "REML")
+  r2 <- partialR2(gmod,gmod_reduced)
+  # print(summary(gmod))
+  p<- visualize_model(gmod,smooth_var = "Hgb",side_density = FALSE,show.data = TRUE, 
+                      xlabel = "Hemoglobin (g/dL)",ylabel = "Overall Accuracy (z)",plabels = timediff.label)
+  print(p)
+  
+  Hgb_long <- df %>% pivot_longer(cols = starts_with("NAR")&contains("Accuracy"),names_to="CogMeasure")
+  model_df <- Hgb_long %>%
+    group_by(CogMeasure)%>%
+    do(fit_tract = tidy(gam(value ~ sex + s(COG_AGE,fx = T) + s(Hgb,k=4, fx = F), data = .,method = "REML"))) %>%
+    unnest(fit_tract)
+  Hgbresults <- model_df %>%
+    filter(term == 's(Hgb)')%>%
+    mutate(fdr.p = p.adjust(p.value,method = "fdr"))
+  result_df <- Hgb_long %>%
+    group_by(CogMeasure)%>%
+    do(partialr2 = model_effects(gam(value ~ sex + s(COG_AGE,fx = T) + s(Hgb,k=4, fx = F), data = .,method = "REML")))%>%
+    unnest(partialr2)%>%
+    left_join(Hgbresults)%>%
+    mutate(Metric = factor(CogMeasure,
+                           levels = c("NAR_Overall_Accuracy",
+                                      "NAR_F1_Exec_Comp_Cog_Accuracy",
+                                      "NAR_F2_Social_Cog_Accuracy",
+                                      "NAR_F3_Memory_Accuracy"),
+                           labels = c("Overall","Executive","Social","Memory")))
+  formatted_table <- format_regression_table(result_df,caption = sprintf("Association between hemoglobin and cognitive subdomains (%s).",timediff.label))
+  formatted_table
+}
+
+Hgb.results<-Hgb.compare %>% group_by(timediff)%>%
+  do(result = Hgbcompare(.))
+print(Hgb.results$result)
+
+```
+
+
+
 #### Ferritin
 ```{r ferritin_cog,warning=FALSE,fig.height=4,eval=TRUE,echo=FALSE, message=FALSE}
 ## Ferritin
@@ -1110,6 +1161,25 @@ supplementary_figure6<-med_effect_age2
 print(supplementary_figure6)
 save_plot(filename = "figs/supplementary_figure6_mediation.svg",supplementary_figure6,base_height = 6,base_width = 6)
 ```
+
+##### SES
+Does Hgb also mediate the association between SES and cognition?  
+
+```{r}
+Hgb <- match_cognition_and_blood(df=df,blood_measure = "Hgb",time_diff = time_diff)
+Hgb <- Hgb %>% left_join(ses,by = "bblid")
+# Mediator pathway (a)
+fit_mediator <- gam(Hgb ~ s(COG_AGE,k=5)+oSex+envSES,data = Hgb)
+
+# indirect path (b)
+fit_indirect <- gam(NAR_Overall_Accuracy ~ s(COG_AGE,k=5)+ Hgb + oSex+ envSES,data = Hgb)
+
+mediation.ses = mediation::mediate(fit_mediator, fit_indirect, treat='envSES', mediator='Hgb', 
+                             boot=T,sims = 10000,boot.ci.type = "bca")
+summary(mediation.ses)
+plot(mediation.ses)
+```
+
 
 #### Non-clinical associations  
 Look at only participants that do not meet clinical cutoffs for iron deficiency. This is to see whether Hgb levels are associated with cognition even when individuals do not meet thresholds for iron deficiency/anemia (including visits with Hgb>=12g/dL).  
