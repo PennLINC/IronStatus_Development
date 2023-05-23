@@ -1,5 +1,5 @@
 ---
-title: "Development of iron status during youth"
+title: "Development of Iron Status Measures during Youth: Associations with Sex, Neighborhood Socioeconomic Status, Cognitive Performance, and Brain Structure"
 author: "Bart Larsen"
 date: "5/09/2022"
 output:
@@ -239,7 +239,7 @@ return(Formatted_table)
 
 ```
 
-# Development of iron status in the PNC and associations with cognitive performance and white matter integrity.  
+# Project overview  
 This page includes detailed output of all analyses executed for this project. It begins with an overview of the sample characteristics. The results the are organized into four parts:  
 1. The developmental analyses. These include effects of age, sex, menarche, and socioeconomic status on each hematological measure of iron status.  
 2. Cognitive analyses. These include the cross-sectional associations between measures of iron status and cognitive factor scores from the Penn Computerized Neurocognitive Battery. Additional analyses are broken down by sex (including a moderated mediation analysis) and individuals who do not meet the laboratory threshold for iron deficiency.  
